@@ -30,7 +30,7 @@ classifiers=['Development Status :: 5 - Production/Stable',
              ]
 
 [project.urls]
-Homepage = "https://github.com/dvicente-miatech/pyodbc
+Homepage = "https://github.com/dvicente-miatech/pyodbc"
 
 [build-system]
 requires = ["setuptools"]
