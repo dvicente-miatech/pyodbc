@@ -1,5 +1,5 @@
 [project]
-name = "pyodbc"
+name = "pyodbc-mi"
 version = "1.0.3"
 
 requires-python = ">=3.9"
@@ -12,9 +12,9 @@ description = "DB API module for ODBC"
 readme = "README.md"
 license = "MIT-0"
 
-authors = [{name = "Michael Kleehammer", email="michael@kleehammer.com"}]
+authors = [{name = "Diego Vicente", email="dvicente@miatech.net"}]
 
-maintainers = [{name = "Michael Kleehammer", email="michael@kleehammer.com"}]
+maintainers = [{name = "Diego Vicente", email="dvicente@miatech.net"}]
 # There are a lot of contributors and I'd like to include everyone that puts in a lot of
 # effort, but is this for the more technical meaning of who makes builds?  Would adding
 # contributors cause confusion.
@@ -30,7 +30,7 @@ classifiers=['Development Status :: 5 - Production/Stable',
              ]
 
 [project.urls]
-Homepage = "https://github.com/mkleehammer/pyodbc"
+Homepage = "https://github.com/dvicente-miatech/pyodbc
 
 [build-system]
 requires = ["setuptools"]
