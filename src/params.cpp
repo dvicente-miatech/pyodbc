@@ -521,7 +521,7 @@ static int PyToCType(Cursor *cur, unsigned char **outbuf, PyObject *cell, ParamI
 
 static bool GetParamType(Cursor* cur, Py_ssize_t iParam, SQLSMALLINT& type);
 
-static void FreeInfos(ParamInfo* a, Py_ssize_t count)
+void FreeInfos(ParamInfo* a, Py_ssize_t count)
 {
     for (Py_ssize_t i = 0; i < count; i++)
     {
