@@ -221,29 +221,4 @@ jobs:
           name: wheels_macos_arm64__${{ github.sha }}
           path: ./wheelhouse/*.whl
 
-  publish:
-    needs: [build_sdist, build_windows_x86_wheels, build_windows_arm64_wheels, build_ubuntu_manylinux_wheels, build_ubuntu_musllinux_wheels, build_macos_x86_wheels, build_macos_arm64_wheels]
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/pyodbc-mi
-    permissions:
-      id-token: write
-      contents: write # for creating release
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: '*__${{ github.sha }}'
-          merge-multiple: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ inputs.version }}
-          files: dist/*
-          generate_release_notes: true
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
