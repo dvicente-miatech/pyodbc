@@ -225,8 +225,8 @@ jobs:
     needs: [build_sdist, build_windows_x86_wheels, build_windows_arm64_wheels, build_ubuntu_manylinux_wheels, build_ubuntu_musllinux_wheels, build_macos_x86_wheels, build_macos_arm64_wheels]
     runs-on: ubuntu-latest
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/pyodbc-mi
+      name: pypi
+      url: https://pypi.org/p/pyodbc-mi
     permissions:
       id-token: write
       contents: write # for creating release
@@ -245,7 +245,7 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-      - name: Publish to TestPyPI
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          repository-url: https://test.pypi.org/legacy/
+          repository-url: https://upload.pypi.org/legacy/
