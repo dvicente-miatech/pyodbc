@@ -38,6 +38,7 @@ struct ParamInfo
     // The following correspond to the SQLBindParameter parameters.
     SQLSMALLINT ValueType;
     SQLSMALLINT ParameterType;
+    SQLSMALLINT IOType;
     SQLULEN     ColumnSize;
     SQLSMALLINT DecimalDigits;
 

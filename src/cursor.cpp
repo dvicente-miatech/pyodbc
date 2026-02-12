@@ -2383,7 +2383,208 @@ static PyObject* Cursor_exit(PyObject* self, PyObject* args)
 }
 
 
+static char CallProcedure_doc[] = 
+    "CallProcedure(procedure, parameters) -> {results: [], parameters: []}\n"
+    "Executes a stored procedure and returns input/output parameters and result sets.\n";
+
+static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
+{
+    if (info.StrLen_or_Ind == SQL_NULL_DATA)
+        Py_RETURN_NONE;
+
+    switch (info.ValueType)
+    {
+    case SQL_C_BIT:
+        return PyBool_FromLong(info.Data.ch != 0);
+    case SQL_C_SLONG:
+    case SQL_C_LONG:
+        return PyLong_FromLong(info.Data.i32);
+    case SQL_C_SBIGINT:
+        return PyLong_FromLongLong(info.Data.i64);
+    case SQL_C_DOUBLE:
+        return PyFloat_FromDouble(info.Data.dbl);
+    case SQL_C_CHAR:
+        if (info.ParameterValuePtr)
+            return PyUnicode_Decode((const char*)info.ParameterValuePtr, info.StrLen_or_Ind == SQL_NTS ? strlen((const char*)info.ParameterValuePtr) : info.StrLen_or_Ind, "utf-8", "replace");
+        Py_RETURN_NONE;
+    case SQL_C_WCHAR:
+         // Assuming UCS-2/UTF-16
+         if (info.ParameterValuePtr)
+             return PyUnicode_DecodeUTF16((const char*)info.ParameterValuePtr, info.StrLen_or_Ind == SQL_NTS ? wcslen((const wchar_t*)info.ParameterValuePtr)*2 : info.StrLen_or_Ind, "replace", 0);
+         Py_RETURN_NONE;
+    // Add other types as needed
+    default:
+        // Fallback for unknown types or complex types not fully implemented in this quick converter
+        Py_RETURN_NONE;
+    }
+}
+
+static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
+{
+    char* szProcedure = 0;
+    PyObject* pParams = 0;
+    if (!PyArg_ParseTuple(args, "sO", &szProcedure, &pParams))
+        return 0;
+
+    Cursor* cur = Cursor_Validate(self, CURSOR_REQUIRE_OPEN);
+    if (!cur) return 0;
+    
+    if (!free_results(cur, FREE_STATEMENT | FREE_PREPARED))
+        return 0;
+
+    Py_ssize_t cParams = PySequence_Size(pParams);
+    if (cParams < 0) return 0;
+
+    // Construct SQL: {CALL proc(?, ?, ...)}
+    // Procedure name might need quoting or strict handling, simpler here:
+    // We assume szProcedure is safe or handled by caller.
+    
+    PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s(", szProcedure);
+    for (Py_ssize_t i = 0; i < cParams; i++) {
+        PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(i == 0 ? "?" : ",?"));
+    }
+    PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(")}"));
+    
+    // Prepare
+    if (!PrepareOnCursor(cur, pSqlString)) {
+        Py_DECREF(pSqlString);
+        return 0;
+    }
+    Py_DECREF(pSqlString);
+
+    // Allocate ParamInfos
+    cur->paramInfos = (ParamInfo*)PyMem_Malloc(sizeof(ParamInfo) * cParams);
+    if (!cur->paramInfos) return PyErr_NoMemory();
+    memset(cur->paramInfos, 0, sizeof(ParamInfo) * cParams);
+
+    // Get Parameter Info and Bind
+    for (Py_ssize_t i = 0; i < cParams; i++) {
+        PyObject* param = PySequence_GetItem(pParams, i);
+        if (!GetParameterInfo(cur, i, param, cur->paramInfos[i], false)) {
+            Py_DECREF(param);
+            FreeInfos(cur->paramInfos, cParams);
+            cur->paramInfos = 0;
+            return 0;
+        }
+        Py_DECREF(param);
+
+        // Force INPUT_OUTPUT, except for TVPs
+        if (cur->paramInfos[i].ParameterType != SQL_SS_TABLE)
+            cur->paramInfos[i].IOType = SQL_PARAM_INPUT_OUTPUT;
+
+        // Fix Buffer for Strings/Binary if not allocated
+        if (!cur->paramInfos[i].allocated) {
+             if (cur->paramInfos[i].ValueType == SQL_C_CHAR || cur->paramInfos[i].ValueType == SQL_C_BINARY) {
+                 SQLLEN newLen = max((SQLLEN)4096, cur->paramInfos[i].BufferLength);
+                 char* newBuf = (char*)PyMem_Malloc(newLen);
+                 if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
+                     memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
+                 else
+                     memset(newBuf, 0, newLen);
+                 cur->paramInfos[i].ParameterValuePtr = newBuf;
+                 cur->paramInfos[i].BufferLength = newLen;
+                 cur->paramInfos[i].allocated = true;
+             }
+             else if (cur->paramInfos[i].ValueType == SQL_C_WCHAR) {
+                 SQLLEN newLen = max((SQLLEN)4096, cur->paramInfos[i].BufferLength);
+                 char* newBuf = (char*)PyMem_Malloc(newLen);
+                 if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
+                     memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
+                 else
+                     memset(newBuf, 0, newLen);
+                 cur->paramInfos[i].ParameterValuePtr = newBuf;
+                 cur->paramInfos[i].BufferLength = newLen;
+                 cur->paramInfos[i].allocated = true;
+             }
+             else if (cur->paramInfos[i].ValueType == SQL_C_DEFAULT) {
+                 // Likely None/Null. Allocate char buffer.
+                 cur->paramInfos[i].ValueType = SQL_C_CHAR;
+                 cur->paramInfos[i].ParameterType = SQL_VARCHAR;
+                 SQLLEN newLen = 4096;
+                 char* newBuf = (char*)PyMem_Malloc(newLen);
+                 memset(newBuf, 0, newLen);
+                 cur->paramInfos[i].ParameterValuePtr = newBuf;
+                 cur->paramInfos[i].BufferLength = newLen;
+                 cur->paramInfos[i].StrLen_or_Ind = SQL_NULL_DATA;
+                 cur->paramInfos[i].allocated = true;
+             }
+        }
+    }
+
+    // Bind
+    for (Py_ssize_t i = 0; i < cParams; i++) {
+        if (!BindParameter(cur, i, cur->paramInfos[i])) {
+            FreeParameterData(cur);
+            return 0;
+        }
+    }
+
+    // Execute
+    SQLRETURN ret;
+    Py_BEGIN_ALLOW_THREADS
+    ret = SQLExecute(cur->hstmt);
+    Py_END_ALLOW_THREADS
+
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA) {
+        RaiseErrorFromHandle(cur->cnxn, "SQLExecute", cur->cnxn->hdbc, cur->hstmt);
+        FreeParameterData(cur);
+        return 0;
+    }
+
+    // Capture Results
+    PyObject* resultsList = PyList_New(0);
+    bool more = true;
+    while (more) {
+        // Fetch logic similar to execute/fetch
+        SQLSMALLINT cCols;
+        Py_BEGIN_ALLOW_THREADS
+        ret = SQLNumResultCols(cur->hstmt, &cCols);
+        Py_END_ALLOW_THREADS
+        
+        if (SQL_SUCCEEDED(ret) && cCols > 0) {
+             if (!PrepareResults(cur, cCols)) break; // Error?
+             if (!create_name_map(cur, cCols, true)) break;
+             
+             PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
+             if (rows) {
+                 PyList_Append(resultsList, rows);
+                 Py_DECREF(rows);
+             }
+        }
+        
+        // Next Set
+        Py_BEGIN_ALLOW_THREADS
+        ret = SQLMoreResults(cur->hstmt);
+        Py_END_ALLOW_THREADS
+        if (ret == SQL_NO_DATA) more = false;
+        else if (!SQL_SUCCEEDED(ret)) {
+             // Handle error or just stop? node-odbc likely stops or throws.
+             more = false; 
+        }
+    }
+
+    // Capture Output Params
+    PyObject* paramsList = PyList_New(cParams);
+    for (Py_ssize_t i = 0; i < cParams; i++) {
+        PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
+        PyList_SetItem(paramsList, i, val);
+    }
+
+    // Cleanup
+    FreeParameterData(cur);
+
+    // Construct Result Dict
+    PyObject* resultDict = PyDict_New();
+    PyDict_SetItemString(resultDict, "results", resultsList);
+    PyDict_SetItemString(resultDict, "parameters", paramsList);
+    Py_DECREF(resultsList);
+    Py_DECREF(paramsList);
+
+    return resultDict;
+}
+
 static PyMethodDef Cursor_methods[] =
+
 {
     { "close",            (PyCFunction)Cursor_close,            METH_NOARGS,                close_doc            },
     { "execute",          (PyCFunction)Cursor_execute,          METH_VARARGS,               execute_doc          },
@@ -2409,6 +2610,7 @@ static PyMethodDef Cursor_methods[] =
     { "commit",           (PyCFunction)Cursor_commit,           METH_NOARGS,                commit_doc           },
     { "rollback",         (PyCFunction)Cursor_rollback,         METH_NOARGS,                rollback_doc         },
     {"cancel",           (PyCFunction)Cursor_cancel,           METH_NOARGS,                cancel_doc},
+    {"CallProcedure",    (PyCFunction)Cursor_CallProcedure,    METH_VARARGS,               CallProcedure_doc },
     {"__enter__",        Cursor_enter,                         METH_NOARGS,                enter_doc            },
     {"__exit__",         Cursor_exit,                          METH_VARARGS,               exit_doc             },
     {0, 0, 0, 0}

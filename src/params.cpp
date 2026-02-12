@@ -1023,7 +1023,13 @@ bool GetParameterInfo(Cursor* cur, Py_ssize_t index, PyObject* param, ParamInfo&
     // Populates `info`.
 
     if (param == Py_None)
+    {
+        info.IOType = SQL_PARAM_INPUT;
         return GetNullInfo(cur, index, info);
+    }
+
+    info.IOType = SQL_PARAM_INPUT;
+
 
     if (param == null_binary)
         return GetNullBinaryInfo(cur, index, info);
@@ -1177,7 +1183,7 @@ bool BindParameter(Cursor* cur, Py_ssize_t index, ParamInfo& info)
 
     SQLRETURN ret = -1;
     Py_BEGIN_ALLOW_THREADS
-    ret = SQLBindParameter(cur->hstmt, (SQLUSMALLINT)(index + 1), SQL_PARAM_INPUT,
+    ret = SQLBindParameter(cur->hstmt, (SQLUSMALLINT)(index + 1), info.IOType,
         info.ValueType, sqltype, colsize, scale, sqltype == SQL_SS_TABLE ? 0 : info.ParameterValuePtr, info.BufferLength, &info.StrLen_or_Ind);
     Py_END_ALLOW_THREADS;
 
@@ -1348,7 +1354,8 @@ void FreeParameterInfo(Cursor* cur)
     cur->paramcount   = 0;
 }
 
-bool Prepare(Cursor* cur, PyObject* pSql)
+bool PrepareOnCursor(Cursor* cur, PyObject* pSql)
+
 {
     //
     // Prepare the SQL if necessary.
@@ -1420,7 +1427,8 @@ bool PrepareAndBind(Cursor* cur, PyObject* pSql, PyObject* original_params, bool
     int        params_offset = skip_first ? 1 : 0;
     Py_ssize_t cParams       = original_params == 0 ? 0 : PySequence_Length(original_params) - params_offset;
 
-    if (!Prepare(cur, pSql))
+    if (!PrepareOnCursor(cur, pSql))
+
         return false;
 
     if (cParams != cur->paramcount)
@@ -1471,7 +1479,8 @@ bool ExecuteMulti(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
     bool ret = true;
     char *szLastFunction = 0;
     SQLRETURN rc = SQL_SUCCESS;
-    if (!Prepare(cur, pSql))
+    if (!PrepareOnCursor(cur, pSql))
+
         return false;
 
     if (!(cur->paramInfos = (ParamInfo*)PyMem_Malloc(sizeof(ParamInfo) * cur->paramcount)))
