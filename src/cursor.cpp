@@ -2580,7 +2580,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         // Fix Buffer for Strings/Binary if not allocated
         if (!cur->paramInfos[i].allocated) {
              if (cur->paramInfos[i].ValueType == SQL_C_CHAR || cur->paramInfos[i].ValueType == SQL_C_BINARY) {
-                 SQLLEN newLen = max((SQLLEN)4096, cur->paramInfos[i].BufferLength);
+                 SQLLEN newLen = ((SQLLEN)4096 > cur->paramInfos[i].BufferLength) ? (SQLLEN)4096 : cur->paramInfos[i].BufferLength;
                  char* newBuf = (char*)PyMem_Malloc(newLen);
                  if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
                      memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
@@ -2591,7 +2591,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                  cur->paramInfos[i].allocated = true;
              }
              else if (cur->paramInfos[i].ValueType == SQL_C_WCHAR) {
-                 SQLLEN newLen = max((SQLLEN)4096, cur->paramInfos[i].BufferLength);
+                 SQLLEN newLen = ((SQLLEN)4096 > cur->paramInfos[i].BufferLength) ? (SQLLEN)4096 : cur->paramInfos[i].BufferLength;
                  char* newBuf = (char*)PyMem_Malloc(newLen);
                  if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
                      memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
