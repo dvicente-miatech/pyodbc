@@ -2503,7 +2503,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     PyObject* pValues = PyList_New(cParams);
     PyObject* pKeys = PyList_New(cParams); // We need keys ordered for output mapping
 
-    for (size_t i = 0; i < cParams; ++i) {
+    for (Py_ssize_t i = 0; i < cParams; ++i) {
         // Find dbParams[i].name in pParams dict
         // Note: Param names from DB might have '@' prefix (SQL Server). Dict keys might not.
         // Or case sensitivity issues. 
@@ -2530,7 +2530,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     }
     
     // Cleanup dbParams names
-    for (size_t i = 0; i < cParams; ++i) {
+    for (Py_ssize_t i = 0; i < cParams; ++i) {
         Py_DECREF(dbParams[i].name);
     }
 
