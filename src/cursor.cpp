@@ -24,6 +24,7 @@
 #include "getdata.h"
 #include "dbspecific.h"
 #include <datetime.h>
+#include <vector>
 
 enum
 {
@@ -2437,15 +2438,105 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     if (!free_results(cur, FREE_STATEMENT | FREE_PREPARED))
         return 0;
 
-    Py_ssize_t cParams = PyDict_Size(pParams);
-    if (cParams < 0) return 0;
+    // 1. Get Procedure Columns from DB to determine order and names
+    SQLRETURN ret;
+    Py_BEGIN_ALLOW_THREADS
+    ret = SQLProcedureColumns(cur->hstmt, NULL, 0, NULL, 0, (SQLCHAR*)szProcedure, SQL_NTS, NULL, 0);
+    Py_END_ALLOW_THREADS
 
-    // Ordered list of keys and values for binding
-    PyObject* pKeys = PyDict_Keys(pParams);
-    PyObject* pValues = PyDict_Values(pParams);
+    if (!SQL_SUCCEEDED(ret)) {
+        return RaiseErrorFromHandle(cur->cnxn, "SQLProcedureColumns", cur->cnxn->hdbc, cur->hstmt);
+    }
+
+    // Bind columns to fetch parameter info
+    // We strictly need COLUMN_NAME (4) and COLUMN_TYPE (5). 
+    // Types: SQL_PARAM_INPUT (1), SQL_PARAM_INPUT_OUTPUT (2), SQL_PARAM_OUTPUT (4), SQL_RETURN_VALUE (5)
+    
+    char paramName[256];
+    SQLSMALLINT paramType;
+    SQLLEN cbParamName, cbParamType;
+    
+    // Bind the results from SQLProcedureColumns
+    // Column 4: COLUMN_NAME
+    SQLBindCol(cur->hstmt, 4, SQL_C_CHAR, paramName, sizeof(paramName), &cbParamName);
+    // Column 5: COLUMN_TYPE
+    SQLBindCol(cur->hstmt, 5, SQL_C_SSHORT, &paramType, 0, &cbParamType);
+
+    struct ProcParam {
+        PyObject* name; // PyUnicode
+        SQLSMALLINT type;
+    };
+    
+    std::vector<ProcParam> dbParams;
+    
+    while (true) {
+        ret = SQLFetch(cur->hstmt);
+        if (ret == SQL_NO_DATA) break;
+        if (!SQL_SUCCEEDED(ret)) {
+             // Log or handle error? For now, break.
+             break;
+        }
+        
+        // Skip RETURN_VALUE (5) usually? Or include it? 
+        // node-odbc often treats output params. Let's include everything except maybe RETURN_VALUE if user didn't ask for it, 
+        // but typically users want to interact with what the procedure defines.
+        // However, we only bind '?' for Input, InputOutput, and Output. 
+        // Drivers often require Return Value to be bound specifically typically as ? = CALL ...
+        // For simplicity, let's filter only P_IN, P_INOUT, P_OUT.
+        if (paramType == SQL_PARAM_INPUT || paramType == SQL_PARAM_INPUT_OUTPUT || paramType == SQL_PARAM_OUTPUT) {
+            ProcParam p;
+            p.name = PyUnicode_FromString(paramName); // Assuming UTF-8/ASCII for name
+            p.type = paramType;
+            dbParams.push_back(p);
+        }
+    }
+    
+    SQLFreeStmt(cur->hstmt, SQL_CLOSE); // Close list of params
+
+    Py_ssize_t cParams = dbParams.size();
+    
+    // If no params found in DB, maybe fallback to using all dict keys? 
+    // But user asked to use DB order. If DB returns 0 params, we assume proc has 0 params.
+    // If dictionary has params but DB says 0, they will be ignored (or we should warn?).
+    
+    // Prepare values list in correct order
+    PyObject* pValues = PyList_New(cParams);
+    PyObject* pKeys = PyList_New(cParams); // We need keys ordered for output mapping
+
+    for (size_t i = 0; i < cParams; ++i) {
+        // Find dbParams[i].name in pParams dict
+        // Note: Param names from DB might have '@' prefix (SQL Server). Dict keys might not.
+        // Or case sensitivity issues. 
+        // Simple attempt: Look up exact match.
+        PyObject* val = PyDict_GetItem(pParams, dbParams[i].name);
+        
+        if (!val) {
+            // Try removing '@' if present in DB name
+            const char* nameStr = PyUnicode_AsUTF8(dbParams[i].name);
+            if (nameStr && nameStr[0] == '@') {
+                PyObject* cleanName = PyUnicode_FromString(nameStr + 1);
+                val = PyDict_GetItem(pParams, cleanName);
+                Py_DECREF(cleanName);
+            }
+        }
+        
+        if (!val) val = Py_None;
+        
+        Py_INCREF(val); // List SetItem steals reference, but GetItem borrows, so we must INCREF
+        PyList_SetItem(pValues, i, val);
+        
+        Py_INCREF(dbParams[i].name);
+        PyList_SetItem(pKeys, i, dbParams[i].name);
+    }
+    
+    // Cleanup dbParams names
+    for (size_t i = 0; i < cParams; ++i) {
+        Py_DECREF(dbParams[i].name);
+    }
 
     // Construct SQL: {CALL proc(?, ?, ...)}
-    // Using simple placeholders ? for each parameter in the dictionary
+    // Procedure name might need quoting or strict handling, simpler here:
+    // We assume szProcedure is safe or handled by caller.
     
     PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s(", szProcedure);
     for (Py_ssize_t i = 0; i < cParams; i++) {
@@ -2482,9 +2573,9 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             return 0;
         }
 
-        // Force INPUT_OUTPUT, except for TVPs
+        // Use DB type for IOType (INPUT, INPUT_OUTPUT, or OUTPUT)
         if (cur->paramInfos[i].ParameterType != SQL_SS_TABLE)
-            cur->paramInfos[i].IOType = SQL_PARAM_INPUT_OUTPUT;
+            cur->paramInfos[i].IOType = dbParams[i].type;
 
         // Fix Buffer for Strings/Binary if not allocated
         if (!cur->paramInfos[i].allocated) {
@@ -2536,7 +2627,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     }
 
     // Execute
-    SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
     ret = SQLExecute(cur->hstmt);
     Py_END_ALLOW_THREADS
@@ -2585,8 +2675,12 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     for (Py_ssize_t i = 0; i < cParams; i++) {
         PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
         if (val != Py_None) { // Only add if it has a value (simulating OUT param capture or changed INOUT)
-             // We use the key from the original dictionary
+             // We use the key from the DB info keys
              PyObject* key = PyList_GetItem(pKeys, i);
+             
+             // Try to remove @ if present for friendlier output? Or keep DB name?
+             // User provided dictionary with clean names probably.
+             // Let's use the DB name as we retrieved it.
              PyDict_SetItem(paramsDict, key, val);
         }
         Py_DECREF(val);
