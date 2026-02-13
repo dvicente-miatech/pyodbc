@@ -2384,8 +2384,8 @@ static PyObject* Cursor_exit(PyObject* self, PyObject* args)
 
 
 static char CallProcedure_doc[] = 
-    "CallProcedure(procedure, parameters) -> {results: [], parameters: []}\n"
-    "Executes a stored procedure and returns input/output parameters and result sets.\n";
+    "call_proc(procedure, parameters) -> {results: [], parameters: {}}\n"
+    "Executes a stored procedure with dictionary parameters and returns input/output parameters and result sets.\n";
 
 static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
 {
@@ -2426,18 +2426,26 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     if (!PyArg_ParseTuple(args, "sO", &szProcedure, &pParams))
         return 0;
 
+    if (!PyDict_Check(pParams)) {
+        PyErr_SetString(PyExc_TypeError, "Parameters must be a dictionary");
+        return 0;
+    }
+
     Cursor* cur = Cursor_Validate(self, CURSOR_REQUIRE_OPEN);
     if (!cur) return 0;
     
     if (!free_results(cur, FREE_STATEMENT | FREE_PREPARED))
         return 0;
 
-    Py_ssize_t cParams = PySequence_Size(pParams);
+    Py_ssize_t cParams = PyDict_Size(pParams);
     if (cParams < 0) return 0;
 
+    // Ordered list of keys and values for binding
+    PyObject* pKeys = PyDict_Keys(pParams);
+    PyObject* pValues = PyDict_Values(pParams);
+
     // Construct SQL: {CALL proc(?, ?, ...)}
-    // Procedure name might need quoting or strict handling, simpler here:
-    // We assume szProcedure is safe or handled by caller.
+    // Using simple placeholders ? for each parameter in the dictionary
     
     PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s(", szProcedure);
     for (Py_ssize_t i = 0; i < cParams; i++) {
@@ -2448,25 +2456,31 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     // Prepare
     if (!PrepareOnCursor(cur, pSqlString)) {
         Py_DECREF(pSqlString);
+        Py_DECREF(pKeys);
+        Py_DECREF(pValues);
         return 0;
     }
     Py_DECREF(pSqlString);
 
     // Allocate ParamInfos
     cur->paramInfos = (ParamInfo*)PyMem_Malloc(sizeof(ParamInfo) * cParams);
-    if (!cur->paramInfos) return PyErr_NoMemory();
+    if (!cur->paramInfos) {
+        Py_DECREF(pKeys);
+        Py_DECREF(pValues);
+        return PyErr_NoMemory();
+    }
     memset(cur->paramInfos, 0, sizeof(ParamInfo) * cParams);
 
     // Get Parameter Info and Bind
     for (Py_ssize_t i = 0; i < cParams; i++) {
-        PyObject* param = PySequence_GetItem(pParams, i);
+        PyObject* param = PyList_GetItem(pValues, i); // Borrowed reference from pValues list
         if (!GetParameterInfo(cur, i, param, cur->paramInfos[i], false)) {
-            Py_DECREF(param);
             FreeInfos(cur->paramInfos, cParams);
             cur->paramInfos = 0;
+            Py_DECREF(pKeys);
+            Py_DECREF(pValues);
             return 0;
         }
-        Py_DECREF(param);
 
         // Force INPUT_OUTPUT, except for TVPs
         if (cur->paramInfos[i].ParameterType != SQL_SS_TABLE)
@@ -2515,6 +2529,8 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     for (Py_ssize_t i = 0; i < cParams; i++) {
         if (!BindParameter(cur, i, cur->paramInfos[i])) {
             FreeParameterData(cur);
+            Py_DECREF(pKeys);
+            Py_DECREF(pValues);
             return 0;
         }
     }
@@ -2528,6 +2544,8 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA) {
         RaiseErrorFromHandle(cur->cnxn, "SQLExecute", cur->cnxn->hdbc, cur->hstmt);
         FreeParameterData(cur);
+        Py_DECREF(pKeys);
+        Py_DECREF(pValues);
         return 0;
     }
 
@@ -2542,7 +2560,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         Py_END_ALLOW_THREADS
         
         if (SQL_SUCCEEDED(ret) && cCols > 0) {
-             if (!PrepareResults(cur, cCols)) break; // Error?
+             if (!PrepareResults(cur, cCols)) break; 
              if (!create_name_map(cur, cCols, true)) break;
              
              PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
@@ -2558,27 +2576,33 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         Py_END_ALLOW_THREADS
         if (ret == SQL_NO_DATA) more = false;
         else if (!SQL_SUCCEEDED(ret)) {
-             // Handle error or just stop? node-odbc likely stops or throws.
              more = false; 
         }
     }
 
-    // Capture Output Params
-    PyObject* paramsList = PyList_New(cParams);
+    // Capture Output Params - return dictionary with keys matching input dictionary
+    PyObject* paramsDict = PyDict_New();
     for (Py_ssize_t i = 0; i < cParams; i++) {
         PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
-        PyList_SetItem(paramsList, i, val);
+        if (val != Py_None) { // Only add if it has a value (simulating OUT param capture or changed INOUT)
+             // We use the key from the original dictionary
+             PyObject* key = PyList_GetItem(pKeys, i);
+             PyDict_SetItem(paramsDict, key, val);
+        }
+        Py_DECREF(val);
     }
-
+    
     // Cleanup
+    Py_DECREF(pKeys);
+    Py_DECREF(pValues);
     FreeParameterData(cur);
 
     // Construct Result Dict
     PyObject* resultDict = PyDict_New();
     PyDict_SetItemString(resultDict, "results", resultsList);
-    PyDict_SetItemString(resultDict, "parameters", paramsList);
+    PyDict_SetItemString(resultDict, "parameters", paramsDict);
     Py_DECREF(resultsList);
-    Py_DECREF(paramsList);
+    Py_DECREF(paramsDict);
 
     return resultDict;
 }
@@ -2610,7 +2634,7 @@ static PyMethodDef Cursor_methods[] =
     { "commit",           (PyCFunction)Cursor_commit,           METH_NOARGS,                commit_doc           },
     { "rollback",         (PyCFunction)Cursor_rollback,         METH_NOARGS,                rollback_doc         },
     {"cancel",           (PyCFunction)Cursor_cancel,           METH_NOARGS,                cancel_doc},
-    {"CallProcedure",    (PyCFunction)Cursor_CallProcedure,    METH_VARARGS,               CallProcedure_doc },
+    {"call_proc",        (PyCFunction)Cursor_CallProcedure,    METH_VARARGS,               CallProcedure_doc },
     {"__enter__",        Cursor_enter,                         METH_NOARGS,                enter_doc            },
     {"__exit__",         Cursor_exit,                          METH_VARARGS,               exit_doc             },
     {0, 0, 0, 0}
