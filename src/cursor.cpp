@@ -12,6 +12,7 @@
 // you are making modifications, feel free to move variable declarations from the top of functions to where they are
 // actually used.
 
+#include <vector>
 #include "pyodbc.h"
 #include "wrapper.h"
 #include "textenc.h"
@@ -24,7 +25,6 @@
 #include "getdata.h"
 #include "dbspecific.h"
 #include <datetime.h>
-#include <vector>
 
 enum
 {
