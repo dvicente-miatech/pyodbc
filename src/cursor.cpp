@@ -2385,7 +2385,7 @@ static PyObject* Cursor_exit(PyObject* self, PyObject* args)
 
 
 static char CallProcedure_doc[] = 
-    "call_proc(procedure, parameters) -> {results: [], parameters: {}}\n"
+    "call_proc(schema, procedure, parameters) -> {results: [], parameters: {}}\n"
     "Executes a stored procedure with dictionary parameters and returns input/output parameters and result sets.\n";
 
 static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
@@ -2422,9 +2422,10 @@ static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
 
 static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
 {
+    char* szSchema = 0;
     char* szProcedure = 0;
     PyObject* pParams = 0;
-    if (!PyArg_ParseTuple(args, "sO", &szProcedure, &pParams))
+    if (!PyArg_ParseTuple(args, "ssO", &szSchema, &szProcedure, &pParams))
         return 0;
 
     if (!PyDict_Check(pParams)) {
@@ -2439,11 +2440,15 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         return 0;
 
     // 1. Get Procedure Columns from DB to determine order and names
-    PySys_WriteStdout("[call_proc] Querying procedure columns for '%s'\n", szProcedure);
+    PySys_WriteStdout("[call_proc] Querying procedure columns for '%s.%s'\n", szSchema, szProcedure);
     
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
-    ret = SQLProcedureColumns(cur->hstmt, NULL, 0, NULL, 0, (SQLCHAR*)szProcedure, SQL_NTS, NULL, 0);
+    ret = SQLProcedureColumns(cur->hstmt, 
+                              NULL, 0,                           // Catalog
+                              (SQLCHAR*)szSchema, SQL_NTS,       // Schema
+                              (SQLCHAR*)szProcedure, SQL_NTS,    // Procedure name
+                              NULL, 0);                          // Column name
     Py_END_ALLOW_THREADS
 
     if (!SQL_SUCCEEDED(ret)) {
@@ -2605,11 +2610,8 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         PyList_SetItem(pKeys, i, paramsToBinding[i].name);
     }
 
-    // Construct SQL: {CALL proc(?, ?, ...)}
-    // Procedure name might need quoting or strict handling, simpler here:
-    // We assume szProcedure is safe or handled by caller.
-    
-    PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s(", szProcedure);
+    // Construct SQL: {CALL schema.proc(?, ?, ...)}
+    PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s.%s(", szSchema, szProcedure);
     for (Py_ssize_t i = 0; i < cParams; i++) {
         PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(i == 0 ? "?" : ",?"));
     }
