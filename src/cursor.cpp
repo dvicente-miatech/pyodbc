@@ -2686,9 +2686,9 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                 Py_DECREF(row);
             }
             
-            if (PyList_Size(rows) > 0) {
-                PyList_Append(resultsList, rows);
-            }
+            // Always append result set, even if empty, to maintain result set structure
+            PySys_WriteStdout("[call_proc] Fetched %d rows from result set\n", (int)PyList_Size(rows));
+            PyList_Append(resultsList, rows);
             Py_DECREF(rows);
         }
         
@@ -2696,9 +2696,13 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         ret = SQLMoreResults(cur->hstmt);
         Py_END_ALLOW_THREADS
         
+        PySys_WriteStdout("[call_proc] SQLMoreResults returned: %d\n", (int)ret);
+        
         if (ret == SQL_NO_DATA) more = false;
         else if (!SQL_SUCCEEDED(ret)) more = false;
     }
+
+    PySys_WriteStdout("[call_proc] Total result sets captured: %d\n", (int)PyList_Size(resultsList));
 
     // Step 8: Retrieve output parameters
     PyObject* paramsDict = PyDict_New();
