@@ -2541,14 +2541,8 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             val = PyDict_GetItem(pParams, key);
         }
         
-        // Validate based on parameter type
-        if (procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT && !val) {
-            Py_DECREF(key);
-            Py_DECREF(pValues);
-            PyErr_Format(PyExc_TypeError, "Required INOUT parameter '%s' not found in dictionary", procParams[i].name);
-            return 0;
-        }
-        
+        // IN and INOUT: use value from dictionary if present, default to None
+        // OUT: not required in input dictionary, default to None
         if (!val) {
             val = Py_None;
         }
@@ -2599,17 +2593,48 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         // For OUTPUT/INOUT params, ensure proper buffer allocation
         bool isOutput = (procParams[i].ioType == SQL_PARAM_OUTPUT || procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT);
         
-        if (!cur->paramInfos[i].allocated && isOutput) {
-            // Allocate buffer for output
+        if (isOutput) {
+            // Allocate buffer for output parameter
             SQLLEN bufSize = (procParams[i].size > 0 && procParams[i].size < 32000) ? procParams[i].size + 1 : 4096;
+
             char* newBuf = (char*)PyMem_Malloc(bufSize);
+            if (!newBuf) {
+                FreeParameterData(cur);
+                Py_DECREF(pValues);
+                return PyErr_NoMemory();
+            }
             memset(newBuf, 0, bufSize);
+
+            // For INOUT params with a value, copy input data into the new buffer before freeing the old one
+            if (procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT && param != Py_None) {
+                if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].StrLen_or_Ind > 0) {
+                    SQLLEN copyLen = cur->paramInfos[i].StrLen_or_Ind;
+                    if (copyLen > bufSize - 1) copyLen = bufSize - 1;
+                    memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, copyLen);
+                } else if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].StrLen_or_Ind == SQL_NTS) {
+                    strncpy(newBuf, (const char*)cur->paramInfos[i].ParameterValuePtr, bufSize - 1);
+                }
+            }
+
+            // Free the old buffer after copying data from it
+            if (cur->paramInfos[i].allocated && cur->paramInfos[i].ParameterValuePtr) {
+                PyMem_Free(cur->paramInfos[i].ParameterValuePtr);
+            }
+
             cur->paramInfos[i].ParameterValuePtr = newBuf;
             cur->paramInfos[i].BufferLength = bufSize;
             cur->paramInfos[i].ValueType = SQL_C_CHAR;
             cur->paramInfos[i].ParameterType = SQL_VARCHAR;
-            cur->paramInfos[i].StrLen_or_Ind = (param == Py_None) ? 0 : SQL_NTS;
+            cur->paramInfos[i].ColumnSize = procParams[i].size > 0 ? procParams[i].size : (SQLULEN)(bufSize - 1);
             cur->paramInfos[i].allocated = true;
+
+            // For pure OUT params with no input, indicate NULL input
+            // For INOUT with value, indicate null-terminated string
+            if (param == Py_None) {
+                cur->paramInfos[i].StrLen_or_Ind = SQL_NULL_DATA;
+            } else {
+                cur->paramInfos[i].StrLen_or_Ind = SQL_NTS;
+            }
         }
         
         if (!BindParameter(cur, i, cur->paramInfos[i])) {
