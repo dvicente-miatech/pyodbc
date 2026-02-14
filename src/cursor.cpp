@@ -2653,6 +2653,10 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         if (cur->paramInfos[i].ParameterType != SQL_SS_TABLE)
             cur->paramInfos[i].IOType = paramsToBinding[i].type;
 
+        // For OUTPUT and INOUT parameters, ensure we have proper buffers even if input is None
+        bool isOutputParam = (paramsToBinding[i].type == SQL_PARAM_OUTPUT || 
+                              paramsToBinding[i].type == SQL_PARAM_INPUT_OUTPUT);
+        
         // Fix Buffer for Strings/Binary if not allocated
         if (!cur->paramInfos[i].allocated) {
              if (cur->paramInfos[i].ValueType == SQL_C_CHAR || cur->paramInfos[i].ValueType == SQL_C_BINARY) {
@@ -2665,6 +2669,11 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                  cur->paramInfos[i].ParameterValuePtr = newBuf;
                  cur->paramInfos[i].BufferLength = newLen;
                  cur->paramInfos[i].allocated = true;
+                 
+                 // For OUTPUT params with NULL input, reset StrLen_or_Ind to receive data
+                 if (isOutputParam && cur->paramInfos[i].StrLen_or_Ind == SQL_NULL_DATA) {
+                     cur->paramInfos[i].StrLen_or_Ind = 0;
+                 }
              }
              else if (cur->paramInfos[i].ValueType == SQL_C_WCHAR) {
                  SQLLEN newLen = ((SQLLEN)4096 > cur->paramInfos[i].BufferLength) ? (SQLLEN)4096 : cur->paramInfos[i].BufferLength;
@@ -2676,6 +2685,11 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                  cur->paramInfos[i].ParameterValuePtr = newBuf;
                  cur->paramInfos[i].BufferLength = newLen;
                  cur->paramInfos[i].allocated = true;
+                 
+                 // For OUTPUT params with NULL input, reset StrLen_or_Ind to receive data
+                 if (isOutputParam && cur->paramInfos[i].StrLen_or_Ind == SQL_NULL_DATA) {
+                     cur->paramInfos[i].StrLen_or_Ind = 0;
+                 }
              }
              else if (cur->paramInfos[i].ValueType == SQL_C_DEFAULT) {
                  // Likely None/Null. Allocate char buffer.
@@ -2686,7 +2700,14 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                  memset(newBuf, 0, newLen);
                  cur->paramInfos[i].ParameterValuePtr = newBuf;
                  cur->paramInfos[i].BufferLength = newLen;
-                 cur->paramInfos[i].StrLen_or_Ind = SQL_NULL_DATA;
+                 
+                 // For OUTPUT/INOUT params, prepare to receive data
+                 if (isOutputParam) {
+                     cur->paramInfos[i].StrLen_or_Ind = 0;
+                 } else {
+                     cur->paramInfos[i].StrLen_or_Ind = SQL_NULL_DATA;
+                 }
+                 
                  cur->paramInfos[i].allocated = true;
              }
         }
