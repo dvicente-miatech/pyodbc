@@ -2661,35 +2661,35 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     PySys_WriteStdout("[call_proc] Execution successful\n");
 
     // Step 7: Capture result sets (if any)
-    // Use raw ODBC calls to avoid type binding issues with certain DB2/i data types
     PyObject* resultsList = PyList_New(0);
     bool more = true;
-    
     while (more) {
-        SQLSMALLINT cCols = 0;
+        // Fetch logic similar to execute/fetch
+        SQLSMALLINT cCols;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLNumResultCols(cur->hstmt, &cCols);
         Py_END_ALLOW_THREADS
         
         if (SQL_SUCCEEDED(ret) && cCols > 0) {
-            PySys_WriteStdout("[call_proc] Result set found with %d columns\n", (int)cCols);
-            
+            if (!PrepareResults(cur, cCols)) break; // Error?
+            if (!create_name_map(cur, cCols, true)) break;
+
             PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
-            
-            // Always append result set, even if empty, to maintain result set structure
-            PySys_WriteStdout("[call_proc] Fetched %d rows from result set\n", (int)PyList_Size(rows));
-            PyList_Append(resultsList, rows);
-            Py_DECREF(rows);
+            if (rows) {
+                PyList_Append(resultsList, rows);
+                Py_DECREF(rows);
+            }
         }
         
+        // Next Set
         Py_BEGIN_ALLOW_THREADS
         ret = SQLMoreResults(cur->hstmt);
         Py_END_ALLOW_THREADS
-        
-        PySys_WriteStdout("[call_proc] SQLMoreResults returned: %d\n", (int)ret);
-        
         if (ret == SQL_NO_DATA) more = false;
-        else if (!SQL_SUCCEEDED(ret)) more = false;
+        else if (!SQL_SUCCEEDED(ret)) {
+             // Handle error or just stop? node-odbc likely stops or throws.
+            more = false; 
+        }
     }
 
     PySys_WriteStdout("[call_proc] Total result sets captured: %d\n", (int)PyList_Size(resultsList));
