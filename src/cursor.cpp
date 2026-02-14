@@ -2636,39 +2636,60 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     PySys_WriteStdout("[call_proc] Execution successful\n");
 
     // Step 7: Capture result sets (if any)
+    // Use raw ODBC calls to avoid type binding issues with certain DB2/i data types
     PyObject* resultsList = PyList_New(0);
     bool more = true;
     
     while (more) {
-        SQLSMALLINT cCols;
+        SQLSMALLINT cCols = 0;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLNumResultCols(cur->hstmt, &cCols);
         Py_END_ALLOW_THREADS
         
         if (SQL_SUCCEEDED(ret) && cCols > 0) {
-            if (PrepareResults(cur, cCols) && create_name_map(cur, cCols, true)) {
-                PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
-                if (rows) {
-                    PyList_Append(resultsList, rows);
-                    Py_DECREF(rows);
-                } else if (PyErr_Occurred()) {
-                    // Fetch failed (e.g. type conversion error on result set)
-                    // Log warning and clear the error so we can continue
-                    PyObject *ptype, *pvalue, *ptraceback;
-                    PyErr_Fetch(&ptype, &pvalue, &ptraceback);
-                    if (pvalue) {
-                        PyObject* errStr = PyObject_Str(pvalue);
-                        if (errStr) {
-                            PySys_WriteStderr("[call_proc] WARNING: Error fetching result set: %s\n", 
-                                              PyUnicode_AsUTF8(errStr));
-                            Py_DECREF(errStr);
-                        }
-                    }
-                    Py_XDECREF(ptype);
-                    Py_XDECREF(pvalue);
-                    Py_XDECREF(ptraceback);
+            PySys_WriteStdout("[call_proc] Result set found with %d columns\n", (int)cCols);
+            
+            // Fetch rows manually using SQLFetch + SQLGetData
+            PyObject* rows = PyList_New(0);
+            
+            while (true) {
+                Py_BEGIN_ALLOW_THREADS
+                ret = SQLFetch(cur->hstmt);
+                Py_END_ALLOW_THREADS
+                
+                if (ret == SQL_NO_DATA) break;
+                if (!SQL_SUCCEEDED(ret)) {
+                    PySys_WriteStderr("[call_proc] WARNING: SQLFetch error, skipping remaining rows\n");
+                    // Clear any Python error
+                    if (PyErr_Occurred()) PyErr_Clear();
+                    break;
                 }
+                
+                // Read each column with SQLGetData as string
+                PyObject* row = PyTuple_New(cCols);
+                for (SQLSMALLINT col = 1; col <= cCols; col++) {
+                    char colBuf[8192];
+                    SQLLEN indicator;
+                    
+                    ret = SQLGetData(cur->hstmt, col, SQL_C_CHAR, colBuf, sizeof(colBuf), &indicator);
+                    
+                    if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                        SQLLEN len = (indicator > 0 && indicator < (SQLLEN)sizeof(colBuf)) ? indicator : strlen(colBuf);
+                        PyTuple_SetItem(row, col - 1, PyUnicode_DecodeUTF8(colBuf, len, "replace"));
+                    } else {
+                        Py_INCREF(Py_None);
+                        PyTuple_SetItem(row, col - 1, Py_None);
+                    }
+                }
+                
+                PyList_Append(rows, row);
+                Py_DECREF(row);
             }
+            
+            if (PyList_Size(rows) > 0) {
+                PyList_Append(resultsList, rows);
+            }
+            Py_DECREF(rows);
         }
         
         Py_BEGIN_ALLOW_THREADS
