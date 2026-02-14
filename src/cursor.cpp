@@ -2390,8 +2390,14 @@ static char CallProcedure_doc[] =
 
 static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
 {
-    if (info.StrLen_or_Ind == SQL_NULL_DATA)
+    // Check for NULL data
+    if (info.StrLen_or_Ind == SQL_NULL_DATA) {
+        PySys_WriteStdout("[GetParamValue] Parameter is NULL\n");
         Py_RETURN_NONE;
+    }
+    
+    PySys_WriteStdout("[GetParamValue] ValueType=%d, StrLen_or_Ind=%lld\n", 
+                      (int)info.ValueType, (long long)info.StrLen_or_Ind);
 
     switch (info.ValueType)
     {
@@ -2405,17 +2411,31 @@ static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
     case SQL_C_DOUBLE:
         return PyFloat_FromDouble(info.Data.dbl);
     case SQL_C_CHAR:
-        if (info.ParameterValuePtr)
-            return PyUnicode_Decode((const char*)info.ParameterValuePtr, info.StrLen_or_Ind == SQL_NTS ? strlen((const char*)info.ParameterValuePtr) : info.StrLen_or_Ind, "utf-8", "replace");
+        if (info.ParameterValuePtr) {
+            // Use StrLen_or_Ind if valid, otherwise use strlen
+            SQLLEN length = info.StrLen_or_Ind;
+            if (length == SQL_NTS || length < 0) {
+                length = strlen((const char*)info.ParameterValuePtr);
+            }
+            PySys_WriteStdout("[GetParamValue] Returning CHAR value, length=%lld\n", (long long)length);
+            return PyUnicode_DecodeUTF8((const char*)info.ParameterValuePtr, length, "replace");
+        }
+        PySys_WriteStdout("[GetParamValue] CHAR buffer is NULL\n");
         Py_RETURN_NONE;
     case SQL_C_WCHAR:
          // Assuming UCS-2/UTF-16
-         if (info.ParameterValuePtr)
-             return PyUnicode_DecodeUTF16((const char*)info.ParameterValuePtr, info.StrLen_or_Ind == SQL_NTS ? wcslen((const wchar_t*)info.ParameterValuePtr)*2 : info.StrLen_or_Ind, "replace", 0);
+         if (info.ParameterValuePtr) {
+             SQLLEN length = info.StrLen_or_Ind;
+             if (length == SQL_NTS || length < 0) {
+                 length = wcslen((const wchar_t*)info.ParameterValuePtr) * 2;
+             }
+             return PyUnicode_DecodeUTF16((const char*)info.ParameterValuePtr, length, "replace", 0);
+         }
          Py_RETURN_NONE;
     // Add other types as needed
     default:
         // Fallback for unknown types or complex types not fully implemented in this quick converter
+        PySys_WriteStdout("[GetParamValue] Unknown ValueType, returning None\n");
         Py_RETURN_NONE;
     }
 }
