@@ -2425,6 +2425,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     char* szSchema = 0;
     char* szProcedure = 0;
     PyObject* pParams = 0;
+    
     if (!PyArg_ParseTuple(args, "ssO", &szSchema, &szProcedure, &pParams))
         return 0;
 
@@ -2439,308 +2440,169 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     if (!free_results(cur, FREE_STATEMENT | FREE_PREPARED))
         return 0;
 
-    // 1. Get Procedure Columns from DB to determine order and names
-    PySys_WriteStdout("[call_proc] Querying procedure columns for '%s.%s'\n", szSchema, szProcedure);
+    PySys_WriteStdout("[call_proc] Calling %s.%s\n", szSchema, szProcedure);
     
+    // Step 1: Query procedure columns from database
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
     ret = SQLProcedureColumns(cur->hstmt, 
-                              NULL, 0,                           // Catalog
-                              (SQLCHAR*)szSchema, SQL_NTS,       // Schema
-                              (SQLCHAR*)szProcedure, SQL_NTS,    // Procedure name
-                              NULL, 0);                          // Column name
+                              NULL, 0,
+                              (SQLCHAR*)szSchema, SQL_NTS,
+                              (SQLCHAR*)szProcedure, SQL_NTS,
+                              NULL, 0);
     Py_END_ALLOW_THREADS
 
     if (!SQL_SUCCEEDED(ret)) {
-        PySys_WriteStderr("[call_proc] ERROR: SQLProcedureColumns failed\n");
         return RaiseErrorFromHandle(cur->cnxn, "SQLProcedureColumns", cur->cnxn->hdbc, cur->hstmt);
     }
 
-    // Bind columns to fetch parameter info
-    // We strictly need COLUMN_NAME (4) and COLUMN_TYPE (5). 
-    // Types: SQL_PARAM_INPUT (1), SQL_PARAM_INPUT_OUTPUT (2), SQL_PARAM_OUTPUT (4), SQL_RETURN_VALUE (5)
-    
+    // Bind result columns
     char paramName[256];
     SQLSMALLINT paramType;
-    SQLLEN cbParamName, cbParamType;
+    SQLSMALLINT dataType;
+    SQLULEN columnSize;
+    SQLLEN cbParamName, cbParamType, cbDataType, cbColumnSize;
     
-    // Bind the results from SQLProcedureColumns
-    // Column 4: COLUMN_NAME
-    SQLBindCol(cur->hstmt, 4, SQL_C_CHAR, paramName, sizeof(paramName), &cbParamName);
-    // Column 5: COLUMN_TYPE
-    SQLBindCol(cur->hstmt, 5, SQL_C_SSHORT, &paramType, 0, &cbParamType);
+    SQLBindCol(cur->hstmt, 4, SQL_C_CHAR, paramName, sizeof(paramName), &cbParamName);      // COLUMN_NAME
+    SQLBindCol(cur->hstmt, 5, SQL_C_SSHORT, &paramType, 0, &cbParamType);                   // COLUMN_TYPE
+    SQLBindCol(cur->hstmt, 6, SQL_C_SSHORT, &dataType, 0, &cbDataType);                     // DATA_TYPE
+    SQLBindCol(cur->hstmt, 8, SQL_C_ULONG, &columnSize, 0, &cbColumnSize);                  // COLUMN_SIZE
 
+    // Collect procedure parameters
     struct ProcParam {
-        PyObject* name; // PyUnicode
-        SQLSMALLINT type;
+        char name[256];
+        SQLSMALLINT ioType;
+        SQLSMALLINT dataType;
+        SQLULEN size;
     };
     
-    std::vector<ProcParam> dbParams;
+    std::vector<ProcParam> procParams;
     
     while (true) {
         ret = SQLFetch(cur->hstmt);
         if (ret == SQL_NO_DATA) break;
-        if (!SQL_SUCCEEDED(ret)) {
-             // Log or handle error? For now, break.
-             break;
-        }
+        if (!SQL_SUCCEEDED(ret)) break;
         
-        // Skip RETURN_VALUE (5) usually? Or include it? 
-        // node-odbc often treats output params. Let's include everything except maybe RETURN_VALUE if user didn't ask for it, 
-        // but typically users want to interact with what the procedure defines.
-        // However, we only bind '?' for Input, InputOutput, and Output. 
-        // Drivers often require Return Value to be bound specifically typically as ? = CALL ...
-        // For simplicity, let's filter only P_IN, P_INOUT, P_OUT.
+        // Only include INPUT, INPUT_OUTPUT, and OUTPUT parameters
         if (paramType == SQL_PARAM_INPUT || paramType == SQL_PARAM_INPUT_OUTPUT || paramType == SQL_PARAM_OUTPUT) {
             ProcParam p;
-            p.name = PyUnicode_FromString(paramName);
-            p.type = paramType;
-            dbParams.push_back(p);
+            strncpy(p.name, paramName, sizeof(p.name));
+            p.name[sizeof(p.name)-1] = '\0';
+            p.ioType = paramType;
+            p.dataType = dataType;
+            p.size = columnSize;
+            procParams.push_back(p);
             
             const char* typeStr = (paramType == SQL_PARAM_INPUT) ? "INPUT" : 
                                   (paramType == SQL_PARAM_INPUT_OUTPUT) ? "INOUT" : "OUTPUT";
-            PySys_WriteStdout("[call_proc] Found parameter: %s (type: %s)\n", paramName, typeStr);
+            PySys_WriteStdout("[call_proc]   Parameter: %s (%s, size=%d)\n", p.name, typeStr, (int)p.size);
         }
     }
     
     SQLFreeStmt(cur->hstmt, SQL_CLOSE);
     
-    PySys_WriteStdout("[call_proc] Total parameters found in DB: %zu\n", dbParams.size());
-
-    // Filter parameters: 
-    // - INPUT and INPUT_OUTPUT: always include
-    // - OUTPUT only: include only if present in dict (optional)
-    // - Validate that all INPUT_OUTPUT params are in the dict (required)
+    PySys_WriteStdout("[call_proc] Found %zu parameters in procedure definition\n", procParams.size());
     
-    struct ParamBinding {
-        PyObject* name;
-        PyObject* value;
-        SQLSMALLINT type;
-    };
+    // Step 2: Build parameter list for binding
+    Py_ssize_t cParams = procParams.size();
     
-    std::vector<ParamBinding> paramsToBinding;
-    std::vector<PyObject*> dbParamNames; // Keep for cleanup
+    PyObject* pValues = PyList_New(cParams);
+    if (!pValues) return PyErr_NoMemory();
     
-    for (size_t i = 0; i < dbParams.size(); ++i) {
-        dbParamNames.push_back(dbParams[i].name);
+    // For each procedure parameter, find value in dictionary or use None
+    for (size_t i = 0; i < procParams.size(); ++i) {
+        PyObject* key = PyUnicode_FromString(procParams[i].name);
+        PyObject* val = PyDict_GetItem(pParams, key);
         
-        // Find dbParams[i].name in pParams dict
-        PyObject* val = PyDict_GetItem(pParams, dbParams[i].name);
-        
-        if (!val) {
-            // Try removing '@' if present in DB name
-            const char* nameStr = PyUnicode_AsUTF8(dbParams[i].name);
-            if (nameStr && nameStr[0] == '@') {
-                PyObject* cleanName = PyUnicode_FromString(nameStr + 1);
-                val = PyDict_GetItem(pParams, cleanName);
-                Py_DECREF(cleanName);
-            }
+        // Try without @ prefix if not found
+        if (!val && procParams[i].name[0] == '@') {
+            Py_DECREF(key);
+            key = PyUnicode_FromString(procParams[i].name + 1);
+            val = PyDict_GetItem(pParams, key);
         }
         
         // Validate based on parameter type
-        if (dbParams[i].type == SQL_PARAM_INPUT_OUTPUT) {
-            // INOUT is mandatory
-            if (!val) {
-                // Cleanup
-                for (size_t j = 0; j < dbParamNames.size(); ++j) {
-                    Py_DECREF(dbParamNames[j]);
-                }
-                PySys_WriteStderr("[call_proc] ERROR: Required INOUT parameter '%s' not found in dictionary\n", 
-                                  PyUnicode_AsUTF8(dbParams[i].name));
-                PyErr_Format(PyExc_TypeError, "Required INOUT parameter '%U' not found in dictionary", dbParams[i].name);
-                return 0;
-            }
-            PySys_WriteStdout("[call_proc] Binding INOUT parameter: %s\n", PyUnicode_AsUTF8(dbParams[i].name));
-            ParamBinding pb;
-            pb.name = dbParams[i].name;
-            Py_INCREF(pb.name);
-            pb.value = val;
-            pb.type = dbParams[i].type;
-            paramsToBinding.push_back(pb);
+        if (procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT && !val) {
+            Py_DECREF(key);
+            Py_DECREF(pValues);
+            PyErr_Format(PyExc_TypeError, "Required INOUT parameter '%s' not found in dictionary", procParams[i].name);
+            return 0;
         }
-        else if (dbParams[i].type == SQL_PARAM_INPUT) {
-            // INPUT: use None if not provided
-            if (!val) {
-                val = Py_None;
-                PySys_WriteStdout("[call_proc] Binding INPUT parameter: %s (default: None)\n", 
-                                  PyUnicode_AsUTF8(dbParams[i].name));
-            } else {
-                PySys_WriteStdout("[call_proc] Binding INPUT parameter: %s\n", PyUnicode_AsUTF8(dbParams[i].name));
-            }
-            ParamBinding pb;
-            pb.name = dbParams[i].name;
-            Py_INCREF(pb.name);
-            pb.value = val;
-            pb.type = dbParams[i].type;
-            paramsToBinding.push_back(pb);
-        }
-        else if (dbParams[i].type == SQL_PARAM_OUTPUT) {
-            // OUTPUT: always include, use None (NULL) if not provided
-            ParamBinding pb;
-            pb.name = dbParams[i].name;
-            Py_INCREF(pb.name);
-            pb.value = val ? val : Py_None;
-            pb.type = dbParams[i].type;
-            paramsToBinding.push_back(pb);
-            
-            if (val) {
-                PySys_WriteStdout("[call_proc] Binding OUTPUT parameter: %s\n", PyUnicode_AsUTF8(dbParams[i].name));
-            } else {
-                PySys_WriteStdout("[call_proc] Binding OUTPUT parameter: %s (default: None)\n", 
-                                  PyUnicode_AsUTF8(dbParams[i].name));
-            }
-        }
-    }
-    
-    // Cleanup original dbParams names
-    for (size_t i = 0; i < dbParamNames.size(); ++i) {
-        Py_DECREF(dbParamNames[i]);
-    }
-
-    Py_ssize_t cParams = paramsToBinding.size();
-    
-    // Prepare values list in correct order
-    PyObject* pValues = PyList_New(cParams);
-    PyObject* pKeys = PyList_New(cParams); // We need keys ordered for output mapping
-
-    for (Py_ssize_t i = 0; i < cParams; ++i) {
-        Py_INCREF(paramsToBinding[i].value);
-        PyList_SetItem(pValues, i, paramsToBinding[i].value);
         
-        Py_INCREF(paramsToBinding[i].name);
-        PyList_SetItem(pKeys, i, paramsToBinding[i].name);
+        if (!val) {
+            val = Py_None;
+        }
+        
+        Py_INCREF(val);
+        PyList_SetItem(pValues, i, val);
+        Py_DECREF(key);
     }
-
-    // Construct SQL: {CALL schema.proc(?, ?, ...)}
+    
+    // Step 3: Build SQL CALL statement
     PyObject* pSqlString = PyUnicode_FromFormat("{CALL %s.%s(", szSchema, szProcedure);
     for (Py_ssize_t i = 0; i < cParams; i++) {
         PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(i == 0 ? "?" : ",?"));
     }
     PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(")}"));
     
-    PySys_WriteStdout("[call_proc] Executing SQL: %s\n", PyUnicode_AsUTF8(pSqlString));
+    PySys_WriteStdout("[call_proc] SQL: %s\n", PyUnicode_AsUTF8(pSqlString));
     
-    // Prepare
+    // Step 4: Prepare statement
     if (!PrepareOnCursor(cur, pSqlString)) {
         Py_DECREF(pSqlString);
-        Py_DECREF(pKeys);
         Py_DECREF(pValues);
         return 0;
     }
     Py_DECREF(pSqlString);
-
-    // Allocate ParamInfos
+    
+    // Step 5: Allocate and bind parameters
     cur->paramInfos = (ParamInfo*)PyMem_Malloc(sizeof(ParamInfo) * cParams);
     if (!cur->paramInfos) {
-        Py_DECREF(pKeys);
         Py_DECREF(pValues);
         return PyErr_NoMemory();
     }
     memset(cur->paramInfos, 0, sizeof(ParamInfo) * cParams);
-
-    // Get Parameter Info and Bind
+    
     for (Py_ssize_t i = 0; i < cParams; i++) {
-        PyObject* param = PyList_GetItem(pValues, i); // Borrowed reference from pValues list
+        PyObject* param = PyList_GetItem(pValues, i);
+        
         if (!GetParameterInfo(cur, i, param, cur->paramInfos[i], false)) {
             FreeInfos(cur->paramInfos, cParams);
             cur->paramInfos = 0;
-            Py_DECREF(pKeys);
             Py_DECREF(pValues);
             return 0;
         }
-
-        // Use DB type for IOType from paramsToBinding
-        if (cur->paramInfos[i].ParameterType != SQL_SS_TABLE)
-            cur->paramInfos[i].IOType = paramsToBinding[i].type;
-
-        // For OUTPUT and INOUT parameters, ensure we have proper buffers even if input is None
-        bool isOutputParam = (paramsToBinding[i].type == SQL_PARAM_OUTPUT || 
-                              paramsToBinding[i].type == SQL_PARAM_INPUT_OUTPUT);
         
-        // Fix Buffer for Strings/Binary if not allocated
-        if (!cur->paramInfos[i].allocated) {
-             if (cur->paramInfos[i].ValueType == SQL_C_CHAR || cur->paramInfos[i].ValueType == SQL_C_BINARY) {
-                 SQLLEN newLen = ((SQLLEN)4096 > cur->paramInfos[i].BufferLength) ? (SQLLEN)4096 : cur->paramInfos[i].BufferLength;
-                 char* newBuf = (char*)PyMem_Malloc(newLen);
-                 if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
-                     memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
-                 else
-                     memset(newBuf, 0, newLen);
-                 cur->paramInfos[i].ParameterValuePtr = newBuf;
-                 cur->paramInfos[i].BufferLength = newLen;
-                 cur->paramInfos[i].allocated = true;
-                 
-                 // For OUTPUT params with NULL input, reset StrLen_or_Ind to receive data
-                 if (isOutputParam && cur->paramInfos[i].StrLen_or_Ind == SQL_NULL_DATA) {
-                     cur->paramInfos[i].StrLen_or_Ind = 0;
-                 }
-             }
-             else if (cur->paramInfos[i].ValueType == SQL_C_WCHAR) {
-                 SQLLEN newLen = ((SQLLEN)4096 > cur->paramInfos[i].BufferLength) ? (SQLLEN)4096 : cur->paramInfos[i].BufferLength;
-                 char* newBuf = (char*)PyMem_Malloc(newLen);
-                 if (cur->paramInfos[i].ParameterValuePtr && cur->paramInfos[i].BufferLength > 0)
-                     memcpy(newBuf, cur->paramInfos[i].ParameterValuePtr, cur->paramInfos[i].BufferLength);
-                 else
-                     memset(newBuf, 0, newLen);
-                 cur->paramInfos[i].ParameterValuePtr = newBuf;
-                 cur->paramInfos[i].BufferLength = newLen;
-                 cur->paramInfos[i].allocated = true;
-                 
-                 // For OUTPUT params with NULL input, reset StrLen_or_Ind to receive data
-                 if (isOutputParam && cur->paramInfos[i].StrLen_or_Ind == SQL_NULL_DATA) {
-                     cur->paramInfos[i].StrLen_or_Ind = 0;
-                 }
-             }
-             else if (cur->paramInfos[i].ValueType == SQL_C_DEFAULT) {
-                 // Likely None/Null. Allocate char buffer.
-                 cur->paramInfos[i].ValueType = SQL_C_CHAR;
-                 cur->paramInfos[i].ParameterType = SQL_VARCHAR;
-                 SQLLEN newLen = 4096;
-                 char* newBuf = (char*)PyMem_Malloc(newLen);
-                 memset(newBuf, 0, newLen);
-                 cur->paramInfos[i].ParameterValuePtr = newBuf;
-                 cur->paramInfos[i].BufferLength = newLen;
-                 
-                 // For OUTPUT/INOUT params, prepare to receive data
-                 if (isOutputParam) {
-                     cur->paramInfos[i].StrLen_or_Ind = 0;
-                 } else {
-                     cur->paramInfos[i].StrLen_or_Ind = SQL_NULL_DATA;
-                 }
-                 
-                 cur->paramInfos[i].allocated = true;
-             }
+        // Set IO type from procedure definition
+        cur->paramInfos[i].IOType = procParams[i].ioType;
+        
+        // For OUTPUT/INOUT params, ensure proper buffer allocation
+        bool isOutput = (procParams[i].ioType == SQL_PARAM_OUTPUT || procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT);
+        
+        if (!cur->paramInfos[i].allocated && isOutput) {
+            // Allocate buffer for output
+            SQLLEN bufSize = (procParams[i].size > 0 && procParams[i].size < 32000) ? procParams[i].size + 1 : 4096;
+            char* newBuf = (char*)PyMem_Malloc(bufSize);
+            memset(newBuf, 0, bufSize);
+            cur->paramInfos[i].ParameterValuePtr = newBuf;
+            cur->paramInfos[i].BufferLength = bufSize;
+            cur->paramInfos[i].ValueType = SQL_C_CHAR;
+            cur->paramInfos[i].ParameterType = SQL_VARCHAR;
+            cur->paramInfos[i].StrLen_or_Ind = (param == Py_None) ? 0 : SQL_NTS;
+            cur->paramInfos[i].allocated = true;
         }
-    }
-
-    // Bind
-    for (Py_ssize_t i = 0; i < cParams; i++) {
+        
         if (!BindParameter(cur, i, cur->paramInfos[i])) {
             FreeParameterData(cur);
-            Py_DECREF(pKeys);
             Py_DECREF(pValues);
             return 0;
         }
     }
-
-    // Log complete CALL with parameter values (for debugging)
-    PyObject* debugSql = PyUnicode_FromFormat("CALL %s.%s(", szSchema, szProcedure);
-    for (Py_ssize_t i = 0; i < cParams; i++) {
-        PyObject* paramValue = PyList_GetItem(pValues, i);
-        PyObject* paramRepr = PyObject_Repr(paramValue);
-        
-        if (i > 0) {
-            PyUnicode_AppendAndDel(&debugSql, PyUnicode_FromString(", "));
-        }
-        
-        PyUnicode_AppendAndDel(&debugSql, paramRepr);
-    }
-    PyUnicode_AppendAndDel(&debugSql, PyUnicode_FromString(")"));
     
-    PySys_WriteStdout("[call_proc] Executing: %s\n", PyUnicode_AsUTF8(debugSql));
-    Py_DECREF(debugSql);
-
-    // Execute
+    Py_DECREF(pValues);
+    
+    // Step 6: Execute
+    PySys_WriteStdout("[call_proc] Executing...\n");
     Py_BEGIN_ALLOW_THREADS
     ret = SQLExecute(cur->hstmt);
     Py_END_ALLOW_THREADS
@@ -2748,70 +2610,62 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA) {
         RaiseErrorFromHandle(cur->cnxn, "SQLExecute", cur->cnxn->hdbc, cur->hstmt);
         FreeParameterData(cur);
-        Py_DECREF(pKeys);
-        Py_DECREF(pValues);
         return 0;
     }
+    
+    PySys_WriteStdout("[call_proc] Execution successful\n");
 
-    // Capture Results
+    // Step 7: Capture result sets (if any)
     PyObject* resultsList = PyList_New(0);
     bool more = true;
+    
     while (more) {
-        // Fetch logic similar to execute/fetch
         SQLSMALLINT cCols;
         Py_BEGIN_ALLOW_THREADS
         ret = SQLNumResultCols(cur->hstmt, &cCols);
         Py_END_ALLOW_THREADS
         
         if (SQL_SUCCEEDED(ret) && cCols > 0) {
-             if (!PrepareResults(cur, cCols)) break; 
-             if (!create_name_map(cur, cCols, true)) break;
-             
-             PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
-             if (rows) {
-                 PyList_Append(resultsList, rows);
-                 Py_DECREF(rows);
-             }
+            if (PrepareResults(cur, cCols) && create_name_map(cur, cCols, true)) {
+                PyObject* rows = Cursor_fetchall((PyObject*)cur, NULL);
+                if (rows) {
+                    PyList_Append(resultsList, rows);
+                    Py_DECREF(rows);
+                }
+            }
         }
         
-        // Next Set
         Py_BEGIN_ALLOW_THREADS
         ret = SQLMoreResults(cur->hstmt);
         Py_END_ALLOW_THREADS
+        
         if (ret == SQL_NO_DATA) more = false;
-        else if (!SQL_SUCCEEDED(ret)) {
-             more = false; 
-        }
+        else if (!SQL_SUCCEEDED(ret)) more = false;
     }
 
-    // Capture Output Params - return dictionary with keys matching input dictionary
+    // Step 8: Retrieve output parameters
     PyObject* paramsDict = PyDict_New();
     for (Py_ssize_t i = 0; i < cParams; i++) {
-        PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
-        if (val != Py_None) { // Only add if it has a value (simulating OUT param capture or changed INOUT)
-             // We use the key from the DB info keys
-             PyObject* key = PyList_GetItem(pKeys, i);
-             
-             // Try to remove @ if present for friendlier output? Or keep DB name?
-             // User provided dictionary with clean names probably.
-             // Let's use the DB name as we retrieved it.
-             PyDict_SetItem(paramsDict, key, val);
+        if (procParams[i].ioType == SQL_PARAM_OUTPUT || procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT) {
+            PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
+            PyObject* key = PyUnicode_FromString(procParams[i].name);
+            PyDict_SetItem(paramsDict, key, val);
+            Py_DECREF(val);
+            Py_DECREF(key);
         }
-        Py_DECREF(val);
     }
     
-    // Cleanup
-    Py_DECREF(pKeys);
-    Py_DECREF(pValues);
     FreeParameterData(cur);
 
-    // Construct Result Dict
+    // Step 9: Return results
     PyObject* resultDict = PyDict_New();
     PyDict_SetItemString(resultDict, "results", resultsList);
     PyDict_SetItemString(resultDict, "parameters", paramsDict);
     Py_DECREF(resultsList);
     Py_DECREF(paramsDict);
 
+    PySys_WriteStdout("[call_proc] Completed successfully\n");
+    
     return resultDict;
 }
 
