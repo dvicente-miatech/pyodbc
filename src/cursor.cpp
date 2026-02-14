@@ -2651,6 +2651,22 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                 if (rows) {
                     PyList_Append(resultsList, rows);
                     Py_DECREF(rows);
+                } else if (PyErr_Occurred()) {
+                    // Fetch failed (e.g. type conversion error on result set)
+                    // Log warning and clear the error so we can continue
+                    PyObject *ptype, *pvalue, *ptraceback;
+                    PyErr_Fetch(&ptype, &pvalue, &ptraceback);
+                    if (pvalue) {
+                        PyObject* errStr = PyObject_Str(pvalue);
+                        if (errStr) {
+                            PySys_WriteStderr("[call_proc] WARNING: Error fetching result set: %s\n", 
+                                              PyUnicode_AsUTF8(errStr));
+                            Py_DECREF(errStr);
+                        }
+                    }
+                    Py_XDECREF(ptype);
+                    Py_XDECREF(pvalue);
+                    Py_XDECREF(ptraceback);
                 }
             }
         }
