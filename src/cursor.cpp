@@ -2575,17 +2575,18 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             paramsToBinding.push_back(pb);
         }
         else if (dbParams[i].type == SQL_PARAM_OUTPUT) {
-            // OUTPUT is optional - only include if provided in dict
+            // OUTPUT: always include, use None (NULL) if not provided
+            ParamBinding pb;
+            pb.name = dbParams[i].name;
+            Py_INCREF(pb.name);
+            pb.value = val ? val : Py_None;
+            pb.type = dbParams[i].type;
+            paramsToBinding.push_back(pb);
+            
             if (val) {
-                ParamBinding pb;
-                pb.name = dbParams[i].name;
-                Py_INCREF(pb.name);
-                pb.value = val;
-                pb.type = dbParams[i].type;
-                paramsToBinding.push_back(pb);
                 PySys_WriteStdout("[call_proc] Binding OUTPUT parameter: %s\n", PyUnicode_AsUTF8(dbParams[i].name));
             } else {
-                PySys_WriteStdout("[call_proc] Skipping OUTPUT parameter: %s (not in dictionary)\n", 
+                PySys_WriteStdout("[call_proc] Binding OUTPUT parameter: %s (default: None)\n", 
                                   PyUnicode_AsUTF8(dbParams[i].name));
             }
         }
@@ -2618,7 +2619,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(")}"));
     
     PySys_WriteStdout("[call_proc] Executing SQL: %s\n", PyUnicode_AsUTF8(pSqlString));
-    PySys_WriteStdout("[call_proc] Total parameters to bind: %zd\n", cParams);
     
     // Prepare
     if (!PrepareOnCursor(cur, pSqlString)) {
@@ -2701,6 +2701,23 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             return 0;
         }
     }
+
+    // Log complete CALL with parameter values (for debugging)
+    PyObject* debugSql = PyUnicode_FromFormat("CALL %s.%s(", szSchema, szProcedure);
+    for (Py_ssize_t i = 0; i < cParams; i++) {
+        PyObject* paramValue = PyList_GetItem(pValues, i);
+        PyObject* paramRepr = PyObject_Repr(paramValue);
+        
+        if (i > 0) {
+            PyUnicode_AppendAndDel(&debugSql, PyUnicode_FromString(", "));
+        }
+        
+        PyUnicode_AppendAndDel(&debugSql, paramRepr);
+    }
+    PyUnicode_AppendAndDel(&debugSql, PyUnicode_FromString(")"));
+    
+    PySys_WriteStdout("[call_proc] Executing: %s\n", PyUnicode_AsUTF8(debugSql));
+    Py_DECREF(debugSql);
 
     // Execute
     Py_BEGIN_ALLOW_THREADS
