@@ -2480,7 +2480,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             p.size = columnSize;
             procParams.push_back(p);
             PySys_WriteStdout("[call_proc] Param: %s, Type: %d, DataType: %d, Size: %lu\n", 
-                              p.name, p.ioType, p.dataType, (unsigned long)p.size);
+                            p.name, p.ioType, p.dataType, (unsigned long)p.size);
         }
     }
     
@@ -2546,7 +2546,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         
         cur->paramInfos[i].ParameterType = SQL_VARCHAR;
         cur->paramInfos[i].ValueType = SQL_C_CHAR;
-        cur->paramInfos[i].InputOutputType = procParams[i].ioType;
+        cur->paramInfos[i].IOType = procParams[i].ioType;  // FIX: IOType not InputOutputType
         
         // Allocate buffer for parameter (for both IN and OUT)
         // Use a generous buffer size for IBM i
