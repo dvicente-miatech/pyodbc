@@ -2426,17 +2426,15 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     
     if (!free_results(cur, FREE_STATEMENT | FREE_PREPARED))
         return 0;
-
-    PySys_WriteStdout("[call_proc] Calling %s.%s\n", szSchema, szProcedure);
     
     // Step 1: Query procedure columns from database
     SQLRETURN ret;
     Py_BEGIN_ALLOW_THREADS
     ret = SQLProcedureColumns(cur->hstmt, 
-                              NULL, 0,
-                              (SQLCHAR*)szSchema, SQL_NTS,
-                              (SQLCHAR*)szProcedure, SQL_NTS,
-                              NULL, 0);
+                            NULL, 0,
+                            (SQLCHAR*)szSchema, SQL_NTS,
+                            (SQLCHAR*)szProcedure, SQL_NTS,
+                            NULL, 0);
     Py_END_ALLOW_THREADS
 
     if (!SQL_SUCCEEDED(ret)) {
@@ -2479,13 +2477,10 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             p.dataType = dataType;
             p.size = columnSize;
             procParams.push_back(p);
-            PySys_WriteStdout("[call_proc] Param: %s, Type: %d, DataType: %d, Size: %lu\n", 
-                            p.name, p.ioType, p.dataType, (unsigned long)p.size);
         }
     }
     
     Py_ssize_t cParams = procParams.size();
-    PySys_WriteStdout("[call_proc] Found %d parameters\n", (int)cParams);
     
     // Close the result set from SQLProcedureColumns
     SQLCloseCursor(cur->hstmt);
@@ -2612,7 +2607,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     Py_DECREF(pValues);
     
     // Step 6: Execute
-    PySys_WriteStdout("[call_proc] Executing...\n");
     Py_BEGIN_ALLOW_THREADS
     ret = SQLExecute(cur->hstmt);
     Py_END_ALLOW_THREADS
@@ -2648,7 +2642,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         }
         
         if (cCols > 0) {
-            PySys_WriteStdout("[call_proc] Result set #%d with %d columns\n", ++resultSetCount, (int)cCols);
+            
             
             // Create a list for this result set
             PyObject* rowsList = PyList_New(0);
@@ -2713,8 +2707,8 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                 PyList_Append(rowsList, rowTuple);
                 Py_DECREF(rowTuple);
             }
-            
-            PySys_WriteStdout("[call_proc] Fetched %d rows\n", rowCount);
+
+            PySys_WriteStdout("[call_proc] Result set #%d with %d rows\n", ++resultSetCount, rowCount);
             PyList_Append(resultsList, rowsList);
             Py_DECREF(rowsList);
         }
@@ -2723,8 +2717,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         Py_BEGIN_ALLOW_THREADS
         ret = SQLMoreResults(cur->hstmt);
         Py_END_ALLOW_THREADS
-        
-        PySys_WriteStdout("[call_proc] SQLMoreResults returned: %d\n", (int)ret);
         
         if (ret == SQL_NO_DATA) {
             more = false;
@@ -2768,8 +2760,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     PyDict_SetItemString(resultDict, "parameters", paramsDict);
     Py_DECREF(resultsList);
     Py_DECREF(paramsDict);
-
-    PySys_WriteStdout("[call_proc] Completed successfully\n");
     
     return resultDict;
 }
