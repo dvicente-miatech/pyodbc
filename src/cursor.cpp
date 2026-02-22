@@ -2644,9 +2644,30 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         if (cCols > 0) {
             
             
+            // Get column names
+            std::vector<PyObject*> colNames;
+            for (SQLSMALLINT col = 0; col < cCols; col++) {
+                SQLCHAR colName[256] = {0};
+                SQLSMALLINT nameLen = 0;
+                SQLSMALLINT dataType;
+                SQLULEN columnSize;
+                SQLSMALLINT decimalDigits;
+                SQLSMALLINT nullable;
+                
+                SQLRETURN retDesc = SQLDescribeCol(cur->hstmt, col + 1, colName, (SQLSMALLINT)sizeof(colName), &nameLen, &dataType, &columnSize, &decimalDigits, &nullable);
+                if (SQL_SUCCEEDED(retDesc)) {
+                    colNames.push_back(PyUnicode_FromString((const char*)colName));
+                } else {
+                    char defaultName[32];
+                    snprintf(defaultName, sizeof(defaultName), "Col%d", col + 1);
+                    colNames.push_back(PyUnicode_FromString(defaultName));
+                }
+            }
+            
             // Create a list for this result set
             PyObject* rowsList = PyList_New(0);
             if (!rowsList) {
+                for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
                 Py_DECREF(resultsList);
                 FreeParameterData(cur);
                 return PyErr_NoMemory();
@@ -2670,9 +2691,10 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                 
                 rowCount++;
                 
-                // Create a tuple for this row
-                PyObject* rowTuple = PyTuple_New(cCols);
-                if (!rowTuple) {
+                // Create a dict for this row
+                PyObject* rowDict = PyDict_New();
+                if (!rowDict) {
+                    for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
                     Py_DECREF(rowsList);
                     Py_DECREF(resultsList);
                     FreeParameterData(cur);
@@ -2701,12 +2723,15 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                         Py_INCREF(Py_None);
                     }
                     
-                    PyTuple_SetItem(rowTuple, col, value);
+                    PyDict_SetItem(rowDict, colNames[col], value);
+                    Py_DECREF(value);
                 }
                 
-                PyList_Append(rowsList, rowTuple);
-                Py_DECREF(rowTuple);
+                PyList_Append(rowsList, rowDict);
+                Py_DECREF(rowDict);
             }
+            
+            for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
 
             PySys_WriteStdout("[call_proc] Result set #%d with %d rows\n", ++resultSetCount, rowCount);
             PyList_Append(resultsList, rowsList);
