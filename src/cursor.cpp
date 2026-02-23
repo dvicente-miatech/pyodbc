@@ -2619,8 +2619,10 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     
     PySys_WriteStdout("[call_proc] Execution successful\n");
 
-    // Step 7: Capture result sets manually without using Cursor_fetchall
-    // This avoids type binding issues with IBM i
+    // Step 7: Capture result sets.
+    // If no result sets exist (SQLNumResultCols fails or cCols==0), 
+    // we skip gracefully and go directly to OUT parameter retrieval.
+    // Always returns results=[] and parameters={} even on errors.
     PyObject* resultsList = PyList_New(0);
     if (!resultsList) {
         FreeParameterData(cur);
@@ -2637,106 +2639,134 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         Py_END_ALLOW_THREADS
         
         if (!SQL_SUCCEEDED(ret)) {
-            PySys_WriteStdout("[call_proc] SQLNumResultCols failed: %d\n", (int)ret);
+            // No result sets available or driver does not support it — skip to OUT params.
+            PySys_WriteStdout("[call_proc] SQLNumResultCols returned %d, no result sets — going to OUT parameters\n", (int)ret);
             break;
         }
         
-        if (cCols > 0) {
+        if (cCols <= 0) {
+            // No columns in this result set — try next result set or finish.
+            Py_BEGIN_ALLOW_THREADS
+            ret = SQLMoreResults(cur->hstmt);
+            Py_END_ALLOW_THREADS
+            if (ret == SQL_NO_DATA || !SQL_SUCCEEDED(ret)) {
+                more = false;
+            }
+            continue;
+        }
+        
+        // Obtain column names via SQLDescribeCol.
+        // If SQLDescribeCol fails for a column, use a fallback name "Col<N>".
+        // If it fails for ALL columns, skip this result set entirely.
+        std::vector<PyObject*> colNames;
+        int describeSuccessCount = 0;
+        for (SQLSMALLINT col = 0; col < cCols; col++) {
+            SQLCHAR colName[256] = {0};
+            SQLSMALLINT nameLen = 0;
+            SQLSMALLINT colDescDataType;
+            SQLULEN colDescSize;
+            SQLSMALLINT colDescDecimals;
+            SQLSMALLINT colDescNullable;
             
+            SQLRETURN retDesc = SQLDescribeCol(cur->hstmt, col + 1, colName, (SQLSMALLINT)sizeof(colName),
+                                               &nameLen, &colDescDataType, &colDescSize, &colDescDecimals, &colDescNullable);
+            if (SQL_SUCCEEDED(retDesc)) {
+                colNames.push_back(PyUnicode_FromString((const char*)colName));
+                describeSuccessCount++;
+            } else {
+                char defaultName[32];
+                snprintf(defaultName, sizeof(defaultName), "Col%d", col + 1);
+                colNames.push_back(PyUnicode_FromString(defaultName));
+                PySys_WriteStdout("[call_proc] SQLDescribeCol failed for column %d, using fallback name\n", col + 1);
+            }
+        }
+        
+        // If no columns could be described at all, skip this result set.
+        if (describeSuccessCount == 0) {
+            PySys_WriteStdout("[call_proc] SQLDescribeCol failed for all %d columns, skipping result set\n", (int)cCols);
+            for (size_t i = 0; i < colNames.size(); i++) Py_XDECREF(colNames[i]);
+            // Move to next result set or finish
+            Py_BEGIN_ALLOW_THREADS
+            ret = SQLMoreResults(cur->hstmt);
+            Py_END_ALLOW_THREADS
+            if (ret == SQL_NO_DATA || !SQL_SUCCEEDED(ret)) {
+                more = false;
+            }
+            continue;
+        }
+        
+        // Create a list for this result set
+        PyObject* rowsList = PyList_New(0);
+        if (!rowsList) {
+            for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+            Py_DECREF(resultsList);
+            FreeParameterData(cur);
+            return PyErr_NoMemory();
+        }
+        
+        // Fetch rows manually
+        int rowCount = 0;
+        while (true) {
+            Py_BEGIN_ALLOW_THREADS
+            ret = SQLFetch(cur->hstmt);
+            Py_END_ALLOW_THREADS
             
-            // Get column names
-            std::vector<PyObject*> colNames;
-            for (SQLSMALLINT col = 0; col < cCols; col++) {
-                SQLCHAR colName[256] = {0};
-                SQLSMALLINT nameLen = 0;
-                SQLSMALLINT dataType;
-                SQLULEN columnSize;
-                SQLSMALLINT decimalDigits;
-                SQLSMALLINT nullable;
-                
-                SQLRETURN retDesc = SQLDescribeCol(cur->hstmt, col + 1, colName, (SQLSMALLINT)sizeof(colName), &nameLen, &dataType, &columnSize, &decimalDigits, &nullable);
-                if (SQL_SUCCEEDED(retDesc)) {
-                    colNames.push_back(PyUnicode_FromString((const char*)colName));
-                } else {
-                    char defaultName[32];
-                    snprintf(defaultName, sizeof(defaultName), "Col%d", col + 1);
-                    colNames.push_back(PyUnicode_FromString(defaultName));
-                }
+            if (ret == SQL_NO_DATA) {
+                break;
             }
             
-            // Create a list for this result set
-            PyObject* rowsList = PyList_New(0);
-            if (!rowsList) {
+            if (!SQL_SUCCEEDED(ret)) {
+                PySys_WriteStdout("[call_proc] SQLFetch failed: %d\n", (int)ret);
+                break;
+            }
+            
+            rowCount++;
+            
+            // Create a dict for this row
+            PyObject* rowDict = PyDict_New();
+            if (!rowDict) {
                 for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+                Py_DECREF(rowsList);
                 Py_DECREF(resultsList);
                 FreeParameterData(cur);
                 return PyErr_NoMemory();
             }
             
-            // Fetch rows manually
-            int rowCount = 0;
-            while (true) {
+            // Get each column value
+            for (SQLSMALLINT col = 0; col < cCols; col++) {
+                char buffer[8192];
+                SQLLEN indicator = 0;
+                
                 Py_BEGIN_ALLOW_THREADS
-                ret = SQLFetch(cur->hstmt);
+                ret = SQLGetData(cur->hstmt, col + 1, SQL_C_CHAR, buffer, sizeof(buffer), &indicator);
                 Py_END_ALLOW_THREADS
                 
-                if (ret == SQL_NO_DATA) {
-                    break;
+                PyObject* value = NULL;
+                
+                if (indicator == SQL_NULL_DATA) {
+                    value = Py_None;
+                    Py_INCREF(Py_None);
+                } else if (SQL_SUCCEEDED(ret)) {
+                    value = PyUnicode_FromString(buffer);
+                } else {
+                    // On error, use None
+                    value = Py_None;
+                    Py_INCREF(Py_None);
                 }
                 
-                if (!SQL_SUCCEEDED(ret)) {
-                    PySys_WriteStdout("[call_proc] SQLFetch failed: %d\n", (int)ret);
-                    break;
-                }
-                
-                rowCount++;
-                
-                // Create a dict for this row
-                PyObject* rowDict = PyDict_New();
-                if (!rowDict) {
-                    for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
-                    Py_DECREF(rowsList);
-                    Py_DECREF(resultsList);
-                    FreeParameterData(cur);
-                    return PyErr_NoMemory();
-                }
-                
-                // Get each column value
-                for (SQLSMALLINT col = 0; col < cCols; col++) {
-                    char buffer[8192];
-                    SQLLEN indicator = 0;
-                    
-                    Py_BEGIN_ALLOW_THREADS
-                    ret = SQLGetData(cur->hstmt, col + 1, SQL_C_CHAR, buffer, sizeof(buffer), &indicator);
-                    Py_END_ALLOW_THREADS
-                    
-                    PyObject* value = NULL;
-                    
-                    if (indicator == SQL_NULL_DATA) {
-                        value = Py_None;
-                        Py_INCREF(Py_None);
-                    } else if (SQL_SUCCEEDED(ret)) {
-                        value = PyUnicode_FromString(buffer);
-                    } else {
-                        // On error, use None
-                        value = Py_None;
-                        Py_INCREF(Py_None);
-                    }
-                    
-                    PyDict_SetItem(rowDict, colNames[col], value);
-                    Py_DECREF(value);
-                }
-                
-                PyList_Append(rowsList, rowDict);
-                Py_DECREF(rowDict);
+                PyDict_SetItem(rowDict, colNames[col], value);
+                Py_DECREF(value);
             }
             
-            for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
-
-            PySys_WriteStdout("[call_proc] Result set #%d with %d rows\n", ++resultSetCount, rowCount);
-            PyList_Append(resultsList, rowsList);
-            Py_DECREF(rowsList);
+            PyList_Append(rowsList, rowDict);
+            Py_DECREF(rowDict);
         }
+        
+        for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+
+        PySys_WriteStdout("[call_proc] Result set #%d with %d rows\n", ++resultSetCount, rowCount);
+        PyList_Append(resultsList, rowsList);
+        Py_DECREF(rowsList);
         
         // Try to move to next result set
         Py_BEGIN_ALLOW_THREADS
@@ -2746,7 +2776,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         if (ret == SQL_NO_DATA) {
             more = false;
         } else if (!SQL_SUCCEEDED(ret)) {
-            PySys_WriteStdout("[call_proc] SQLMoreResults failed: %d\n", (int)ret);
+            PySys_WriteStdout("[call_proc] SQLMoreResults returned %d, finishing\n", (int)ret);
             more = false;
         }
     }
