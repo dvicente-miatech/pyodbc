@@ -2528,6 +2528,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     Py_DECREF(pSqlString);
     
     // Step 5: Allocate and bind parameters
+    if (cParams > 0) {
     cur->paramInfos = (ParamInfo*)PyMem_Malloc(sizeof(ParamInfo) * cParams);
     if (!cur->paramInfos) {
         Py_DECREF(pValues);
@@ -2544,9 +2545,10 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         cur->paramInfos[i].IOType = procParams[i].ioType;  // FIX: IOType not InputOutputType
         
         // Allocate buffer for parameter (for both IN and OUT)
-        // Use a generous buffer size for IBM i
+        // Cap the buffer size to avoid MemoryError with large OUT/INOUT column sizes
         SQLLEN bufSize = procParams[i].size > 0 ? procParams[i].size + 1 : 256;
         if (bufSize < 256) bufSize = 256;
+        if (bufSize > 65536) bufSize = 65536;  // Cap to 64KB max per parameter
         
         char* newBuf = (char*)PyMem_Malloc(bufSize);
         if (!newBuf) {
@@ -2586,7 +2588,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         
         cur->paramInfos[i].ParameterValuePtr = newBuf;
         cur->paramInfos[i].BufferLength = bufSize;
-        cur->paramInfos[i].ColumnSize = procParams[i].size > 0 ? procParams[i].size : (SQLULEN)(bufSize - 1);
+        cur->paramInfos[i].ColumnSize = (SQLULEN)(bufSize - 1);
         cur->paramInfos[i].allocated = true;
 
         // For pure OUT params with no input, indicate NULL input
@@ -2603,6 +2605,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             return 0;
         }
     }
+    } // end if (cParams > 0)
     
     Py_DECREF(pValues);
     
