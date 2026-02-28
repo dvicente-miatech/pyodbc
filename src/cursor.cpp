@@ -2517,8 +2517,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     }
     PyUnicode_AppendAndDel(&pSqlString, PyUnicode_FromString(")}"));
     
-    PySys_WriteStdout("[call_proc] SQL: %s\n", PyUnicode_AsUTF8(pSqlString));
-    
     // Step 4: Prepare statement
     if (!PrepareOnCursor(cur, pSqlString)) {
         Py_DECREF(pSqlString);
@@ -2619,8 +2617,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         FreeParameterData(cur);
         return 0;
     }
-    
-    PySys_WriteStdout("[call_proc] Execution successful\n");
 
     // Step 7: Capture result sets.
     // If no result sets exist (SQLNumResultCols fails or cCols==0), 
@@ -2643,7 +2639,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         
         if (!SQL_SUCCEEDED(ret)) {
             // No result sets available or driver does not support it — skip to OUT params.
-            PySys_WriteStdout("[call_proc] SQLNumResultCols returned %d, no result sets — going to OUT parameters\n", (int)ret);
             break;
         }
         
@@ -2680,13 +2675,11 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
                 char defaultName[32];
                 snprintf(defaultName, sizeof(defaultName), "Col%d", col + 1);
                 colNames.push_back(PyUnicode_FromString(defaultName));
-                PySys_WriteStdout("[call_proc] SQLDescribeCol failed for column %d, using fallback name\n", col + 1);
             }
         }
         
         // If no columns could be described at all, skip this result set.
         if (describeSuccessCount == 0) {
-            PySys_WriteStdout("[call_proc] SQLDescribeCol failed for all %d columns, skipping result set\n", (int)cCols);
             for (size_t i = 0; i < colNames.size(); i++) Py_XDECREF(colNames[i]);
             // Move to next result set or finish
             Py_BEGIN_ALLOW_THREADS
@@ -2719,7 +2712,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             }
             
             if (!SQL_SUCCEEDED(ret)) {
-                PySys_WriteStdout("[call_proc] SQLFetch failed: %d\n", (int)ret);
                 break;
             }
             
@@ -2767,7 +2759,6 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         
         for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
 
-        PySys_WriteStdout("[call_proc] Result set #%d with %d rows\n", ++resultSetCount, rowCount);
         PyList_Append(resultsList, rowsList);
         Py_DECREF(rowsList);
         
@@ -2779,12 +2770,9 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         if (ret == SQL_NO_DATA) {
             more = false;
         } else if (!SQL_SUCCEEDED(ret)) {
-            PySys_WriteStdout("[call_proc] SQLMoreResults returned %d, finishing\n", (int)ret);
             more = false;
         }
     }
-
-    PySys_WriteStdout("[call_proc] Total result sets: %d\n", (int)PyList_Size(resultsList));
 
     // Step 8: Retrieve output parameters
     PyObject* paramsDict = PyDict_New();
