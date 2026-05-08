@@ -1833,15 +1833,20 @@ int ExecuteMulti(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
 
 // ExecuteMultiFallback: prepare-once / bind-once / execute-N
 //
-// Used when the driver does not support ODBC parameter arrays (SQL_ATTR_PARAMSET_SIZE).
+// Used when the driver does not support ODBC parameter arrays (SQL_ATTR_PARAMSET_SIZE),
+// or when the driver rejects SQL_ATTR_PARAM_BIND_OFFSET_PTR at SQLExecute time with
+// HYC00 "Driver not capable" (e.g. IBM i Access ODBC driver, native error 30058).
+//
 // Strategy:
 //   1. Prepare the statement once via PrepareOnCursor.
-//   2. Scan the first row to detect C types and allocate one row-sized buffer.
-//   3. Call SQLBindParameter once per parameter, pointing into the buffer.
-//   4. For every row: fill the buffer via PyToCType, then call SQLExecute.
+//   2. Allocate a real data buffer (no fake-pointer trick).
+//   3. Call SQLBindParameter once per parameter pointing directly into the real buffer.
+//      SQL_ATTR_PARAM_BIND_OFFSET_PTR is never set.
+//   4. For every row: overwrite the buffer in-place via PyToCType (data + length
+//      indicators are stored contiguously), then call SQLExecute.
 //
-// This avoids the per-row SQLBindParameter overhead of the default slow path while
-// remaining compatible with drivers that lack array-binding support.
+// Since the bindings already point to the real buffer and PyToCType updates both the
+// data bytes and the SQLLEN indicator in-place, no re-binding is needed between rows.
 bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
 {
     SQLRETURN rc = SQL_SUCCESS;
@@ -1901,7 +1906,7 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
         return true;
     }
 
-    // ---- Scan the first row to detect C types and calculate the buffer layout ----
+    // ---- Scan the first row to detect C types and calculate buffer layout ----
     PyObject* firstrow = rowptr[0];
     if (!PyTuple_Check(firstrow) && !PyList_Check(firstrow) && !Row_Check(firstrow))
     {
@@ -1926,22 +1931,43 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
     }
 
     {
+        // ---- Compute buffer layout using DetectCType on first row ----
         PyObject** cells = PySequence_Fast_ITEMS(colseq);
-        // Fake-pointer pass to compute layout (same trick as ExecuteMulti).
-        char* bindptr = (char*)16;
+        Py_ssize_t rowlen = 0;
         for (Py_ssize_t i = 0; i < cur->paramcount; i++)
         {
             if (!DetectCType(cells[i], &cur->paramInfos[i]))
                 goto FallbackErr2;
+            // Each slot: data bytes + SQLLEN indicator
+            rowlen += cur->paramInfos[i].BufferLength + sizeof(SQLLEN);
+        }
+
+        // ---- Allocate the single-row buffer with real addresses ----
+        cur->paramArray = (unsigned char*)PyMem_Malloc(rowlen);
+        if (!cur->paramArray)
+        {
+            PyErr_NoMemory();
+            goto FallbackErr2;
+        }
+
+        // ---- Bind each parameter directly to its slot in the real buffer ----
+        // No SQL_ATTR_PARAM_BIND_OFFSET_PTR is used; pointers are absolute.
+        unsigned char* bindptr = cur->paramArray;
+        for (Py_ssize_t i = 0; i < cur->paramcount; i++)
+        {
+            SQLPOINTER  pData = (SQLPOINTER)bindptr;
+            SQLLEN*     pInd  = (SQLLEN*)(bindptr + cur->paramInfos[i].BufferLength);
 
             if (!SQL_SUCCEEDED(SQLBindParameter(cur->hstmt, i + 1, SQL_PARAM_INPUT,
                     cur->paramInfos[i].ValueType, cur->paramInfos[i].ParameterType,
                     cur->paramInfos[i].ColumnSize, cur->paramInfos[i].DecimalDigits,
-                    bindptr, cur->paramInfos[i].BufferLength,
-                    (SQLLEN*)(bindptr + cur->paramInfos[i].BufferLength))))
+                    pData, cur->paramInfos[i].BufferLength, pInd)))
             {
                 RaiseErrorFromHandle(cur->cnxn, "SQLBindParameter", GetConnection(cur)->hdbc, cur->hstmt);
+            FallbackErrBound:
                 SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
+                PyMem_Free(cur->paramArray);
+                cur->paramArray = 0;
                 goto FallbackErr2;
             }
             if (cur->paramInfos[i].ValueType == SQL_C_NUMERIC)
@@ -1951,42 +1977,15 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
                 SQLSetDescField(desc, i + 1, SQL_DESC_TYPE,      (SQLPOINTER)SQL_C_NUMERIC, 0);
                 SQLSetDescField(desc, i + 1, SQL_DESC_PRECISION,  (SQLPOINTER)cur->paramInfos[i].ColumnSize, 0);
                 SQLSetDescField(desc, i + 1, SQL_DESC_SCALE,      (SQLPOINTER)(uintptr_t)cur->paramInfos[i].DecimalDigits, 0);
-                SQLSetDescField(desc, i + 1, SQL_DESC_DATA_PTR,   bindptr, 0);
+                SQLSetDescField(desc, i + 1, SQL_DESC_DATA_PTR,   pData, 0);
             }
             bindptr += cur->paramInfos[i].BufferLength + sizeof(SQLLEN);
-        }
-        Py_ssize_t rowlen = bindptr - (char*)16;
-
-        // Allocate the single-row buffer.
-        cur->paramArray = (unsigned char*)PyMem_Malloc(rowlen);
-        if (!cur->paramArray)
-        {
-            PyErr_NoMemory();
-            SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
-            goto FallbackErr2;
-        }
-
-        // Fix up the real bind offset so ODBC addresses land in our buffer.
-        SQLULEN bop = (SQLULEN)(cur->paramArray) - 16;
-        if (!SQL_SUCCEEDED(SQLSetStmtAttr(cur->hstmt, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-                (SQLPOINTER)&bop, SQL_IS_POINTER)))
-        {
-            // If even the offset ptr attribute is unsupported, fall through to a simple
-            // re-bind approach: copy the data into the original fake-pointer addresses by
-            // shifting.  This is extremely unlikely but safe.
-            // For now, raise a proper error so it is visible.
-            RaiseErrorFromHandle(cur->cnxn, "SQLSetStmtAttr(SQL_ATTR_PARAM_BIND_OFFSET_PTR)",
-                                 GetConnection(cur)->hdbc, cur->hstmt);
-            PyMem_Free(cur->paramArray);
-            cur->paramArray = 0;
-            SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
-            goto FallbackErr2;
         }
 
         Py_DECREF(colseq);
         colseq = 0;
 
-        // ---- Execute loop: one SQLExecute per row ----
+        // ---- Execute loop: fill buffer in-place, SQLExecute once per row ----
         for (Py_ssize_t r = 0; r < rowcount; r++)
         {
             PyObject* currow = rowptr[r];
@@ -1994,10 +1993,9 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
             if (!colseq)
             {
             FallbackErrExec:
-                SQLSetStmtAttr(cur->hstmt, SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0, SQL_IS_POINTER);
+                SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
                 PyMem_Free(cur->paramArray);
                 cur->paramArray = 0;
-                SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
                 Py_DECREF(rowseq);
                 FreeInfos(cur->paramInfos, cur->paramcount);
                 cur->paramInfos = 0;
@@ -2011,7 +2009,9 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
                 goto FallbackErrExec;
             }
 
-            // Fill the row buffer.
+            // Overwrite the buffer in-place.  PyToCType writes both the data bytes and
+            // the SQLLEN indicator into the contiguous slots, exactly where SQLBindParameter
+            // already pointed.
             unsigned char* pDat = cur->paramArray;
             PyObject** rowcells = PySequence_Fast_ITEMS(colseq);
             bool conv_ok = true;
@@ -2029,7 +2029,7 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
             if (!conv_ok)
                 goto FallbackErrExec;
 
-            // Execute with the current row's data.
+            // Execute with the current row's data already in the bound buffer.
             Py_BEGIN_ALLOW_THREADS
             rc = SQLExecute(cur->hstmt);
             Py_END_ALLOW_THREADS
@@ -2048,10 +2048,13 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
 
             if (rc == SQL_SUCCESS_WITH_INFO)
                 GetDiagRecs(cur);
+
+            // Close the cursor so the HSTMT is ready for the next SQLExecute.
+            SQLFreeStmt(cur->hstmt, SQL_CLOSE);
         }
 
-        // Cleanup.
-        SQLSetStmtAttr(cur->hstmt, SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0, SQL_IS_POINTER);
+        // Cleanup bindings and buffer.
+        SQLFreeStmt(cur->hstmt, SQL_RESET_PARAMS);
         PyMem_Free(cur->paramArray);
         cur->paramArray = 0;
     }
