@@ -1065,8 +1065,42 @@ static PyObject* Cursor_executemany(PyObject* self, PyObject* args)
         if (cursor->fastexecmany)
         {
             free_results(cursor, FREE_STATEMENT | KEEP_PREPARED);
-            if (!ExecuteMulti(cursor, pSql, param_seq))
-                return 0;
+
+            if (cursor->cnxn->supports_param_arrays)
+            {
+                int r = ExecuteMulti(cursor, pSql, param_seq);
+                if (r == 1)
+                {
+                    // Array binding succeeded.
+                }
+                else if (r == -1)
+                {
+                    // Driver does not support parameter arrays (e.g. IBM i Access ODBC).
+                    // Remember this for the lifetime of the connection so we skip the
+                    // array-binding attempt on future calls.
+                    cursor->cnxn->supports_param_arrays = false;
+                    PyErr_WarnEx(PyExc_UserWarning,
+                        "fast_executemany: driver does not support parameter arrays "
+                        "(SQL_ATTR_PARAMSET_SIZE), falling back to prepare-once/execute-N mode. "
+                        "This message is shown only once per connection.", 1);
+                    if (PyErr_Occurred() && !PyErr_ExceptionMatches(PyExc_Warning))
+                        return 0; // warning was turned into an error by the caller
+                    PyErr_Clear();
+                    if (!ExecuteMultiFallback(cursor, pSql, param_seq))
+                        return 0;
+                }
+                else
+                {
+                    // r == 0: error, Python exception already set.
+                    return 0;
+                }
+            }
+            else
+            {
+                // Connection already known not to support array binding.
+                if (!ExecuteMultiFallback(cursor, pSql, param_seq))
+                    return 0;
+            }
         }
         else
         {

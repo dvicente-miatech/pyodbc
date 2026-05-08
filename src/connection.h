@@ -39,6 +39,12 @@ struct Connection
     // to insert NULLs into binary columns.
     bool supports_describeparam;
 
+    // Will be true if the driver supports ODBC parameter arrays (SQL_ATTR_PARAMSET_SIZE /
+    // SQL_ATTR_PARAM_BIND_TYPE).  Set to false the first time fast_executemany detects that the
+    // driver does not support array binding so that subsequent calls fall directly to the
+    // prepare-once/execute-N fallback without re-trying the array path.
+    bool supports_param_arrays;
+
     // The column size of datetime columns, obtained from SQLGetInfo(), used to determine the datetime precision.
     int datetime_precision;
 

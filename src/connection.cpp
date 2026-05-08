@@ -336,6 +336,7 @@ PyObject* Connection_New(PyObject* pConnectString, bool fAutoCommit, long timeou
     cnxn->odbc_major             = p->odbc_major;
     cnxn->odbc_minor             = p->odbc_minor;
     cnxn->supports_describeparam = p->supports_describeparam;
+    cnxn->supports_param_arrays  = true; // will be set to false if driver rejects SQL_ATTR_PARAMSET_SIZE
     cnxn->datetime_precision     = p->datetime_precision;
     cnxn->need_long_data_len     = p->need_long_data_len;
     cnxn->varchar_maxlength      = p->varchar_maxlength;

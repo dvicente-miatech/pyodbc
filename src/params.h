@@ -7,7 +7,17 @@ bool Params_init();
 struct Cursor;
 
 bool PrepareAndBind(Cursor* cur, PyObject* pSql, PyObject* params, bool skip_first);
-bool ExecuteMulti(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
+
+// Returns:  1 = success
+//           0 = error (Python exception already set)
+//          -1 = driver does not support parameter arrays; caller should fall back to ExecuteMultiFallback
+int ExecuteMulti(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
+
+// Fallback for drivers that do not support ODBC parameter arrays (e.g. IBM i Access ODBC).
+// Prepares the statement once, binds parameters once, then calls SQLExecute once per row
+// updating the already-bound buffers in place.  Much faster than the default row-by-row
+// path which re-binds on every iteration.
+bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
 bool GetParameterInfo(Cursor* cur, Py_ssize_t index, PyObject* param, ParamInfo& info, bool isTVP);
 bool PrepareOnCursor(Cursor* cur, PyObject* pSql); // Renamed to avoid conflicts if 'Prepare' is common
 bool BindParameter(Cursor* cur, Py_ssize_t index, ParamInfo& info);
