@@ -1090,7 +1090,22 @@ static bool getObjectValue(PyObject *pObject, long& nValue)
   {
     nValue = PyLong_AsLong(pObject);
     return true;
-  }
+}
+
+
+// ---------------------------------------------------------------------------
+// ExecuteBatch
+//
+// Public entry point for Cursor_executebatch.  Chooses the optimal strategy:
+//   - INSERT ... VALUES (?,...)  → ExecuteBatchInsert  (single multi-row SQL)
+//   - everything else            → ExecuteMultiFallback (prepare-once/execute-N)
+// ---------------------------------------------------------------------------
+bool ExecuteBatch(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
+{
+    if (IsInsertValues(pSql))
+        return ExecuteBatchInsert(cur, pSql, paramArrayObj);
+    return ExecuteMultiFallback(cur, pSql, paramArrayObj);
+}
 
   return false;
 }

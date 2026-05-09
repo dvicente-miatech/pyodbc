@@ -2898,18 +2898,7 @@ static PyObject* Cursor_executebatch(PyObject* self, PyObject* args)
 
     free_results(cursor, FREE_STATEMENT | KEEP_PREPARED);
 
-    bool ok;
-    if (IsInsertValues(pSql))
-    {
-        // INSERT ... VALUES (?,?) → expand to multi-row VALUES, 1 SQLExecute per sub-batch
-        ok = ExecuteBatchInsert(cursor, pSql, param_seq);
-    }
-    else
-    {
-        // UPDATE / DELETE / MERGE / anything else →
-        // prepare-once / bind-once / execute-N  (IBM i compatible, no array binding)
-        ok = ExecuteMultiFallback(cursor, pSql, param_seq);
-    }
+    bool ok = ExecuteBatch(cursor, pSql, param_seq);
 
     if (!ok)
         return 0;

@@ -26,6 +26,7 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
 // limit would be exceeded).
 // For UPDATE / DELETE / MERGE, callers should use ExecuteMultiFallback instead.
 bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
+bool ExecuteBatch(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj);
 bool GetParameterInfo(Cursor* cur, Py_ssize_t index, PyObject* param, ParamInfo& info, bool isTVP);
 bool PrepareOnCursor(Cursor* cur, PyObject* pSql); // Renamed to avoid conflicts if 'Prepare' is common
 bool BindParameter(Cursor* cur, Py_ssize_t index, ParamInfo& info);
