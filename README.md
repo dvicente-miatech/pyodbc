@@ -65,3 +65,62 @@ cnxn.close()
 The `call_proc` method returns a dictionary with:
 - `results`: List of result sets returned by the procedure
 - `parameters`: Dictionary of output and input/output parameter values
+
+### Batch Execution with `executebatch`
+
+`executebatch` is a high-performance alternative to `executemany` that avoids per-row
+re-binding overhead. It automatically selects the best strategy depending on the SQL statement:
+
+- **`INSERT ... VALUES (?, ...)`** — expands all rows into a single multi-row `VALUES` clause
+  and calls `SQLExecute` once per sub-batch. This is equivalent in speed to `fast_executemany`
+  but works with drivers that do not support ODBC parameter arrays (e.g. IBM i Access ODBC).
+- **`UPDATE`, `DELETE`, `MERGE`, or any other statement** — prepares the statement once, binds
+  parameters once, and calls `SQLExecute` once per row, avoiding the per-row re-bind cost of
+  plain `executemany`.
+
+```python
+import pyodbc
+
+cnxn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;DATABASE=test;...")
+cursor = cnxn.cursor()
+
+# INSERT — multi-row VALUES, single SQLExecute per sub-batch
+rows = [
+    (1, "Alice", 30),
+    (2, "Bob",   25),
+    (3, "Carol", 35),
+]
+cursor.executebatch(
+    "INSERT INTO employees (id, name, age) VALUES (?, ?, ?)",
+    rows
+)
+cnxn.commit()
+
+# UPDATE — prepare-once / execute-N (no per-row re-bind)
+updates = [
+    (31, 1),
+    (26, 2),
+]
+cursor.executebatch(
+    "UPDATE employees SET age = ? WHERE id = ?",
+    updates
+)
+cnxn.commit()
+
+cnxn.close()
+```
+
+#### Comparison with `executemany` and `fast_executemany`
+
+| Feature | `executemany` | `fast_executemany=True` | `executebatch` |
+|---|---|---|---|
+| Per-row re-bind | Yes | No | No |
+| Uses ODBC parameter arrays | No | Yes | No |
+| Compatible with IBM i / limited drivers | Yes | Sometimes fails | **Yes** |
+| INSERT multi-row VALUES optimization | No | No | **Yes** |
+| Works with UPDATE / DELETE / MERGE | Yes | Yes | **Yes** |
+
+Use `executebatch` when:
+- You need bulk INSERT performance without enabling `fast_executemany`
+- Your ODBC driver does not support `SQL_ATTR_PARAMSET_SIZE` (e.g. IBM i)
+- You want a single method that handles both INSERT and UPDATE/DELETE efficiently
