@@ -1090,22 +1090,7 @@ static bool getObjectValue(PyObject *pObject, long& nValue)
   {
     nValue = PyLong_AsLong(pObject);
     return true;
-}
-
-
-// ---------------------------------------------------------------------------
-// ExecuteBatch
-//
-// Public entry point for Cursor_executebatch.  Chooses the optimal strategy:
-//   - INSERT ... VALUES (?,...)  → ExecuteBatchInsert  (single multi-row SQL)
-//   - everything else            → ExecuteMultiFallback (prepare-once/execute-N)
-// ---------------------------------------------------------------------------
-bool ExecuteBatch(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
-{
-    if (IsInsertValues(pSql))
-        return ExecuteBatchInsert(cur, pSql, paramArrayObj);
-    return ExecuteMultiFallback(cur, pSql, paramArrayObj);
-}
+  }
 
   return false;
 }
@@ -2294,12 +2279,11 @@ bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
         return false;
     }
 
-    // ---- Determine max params per statement from the driver ---------------
-    SQLUSMALLINT maxParams = 0;
-    SQLGetInfo(cur->cnxn->hdbc, SQL_MAX_PARAMS_IN_SELECT,
-               &maxParams, sizeof(maxParams), NULL);
-    if (maxParams == 0)
-        maxParams = 32767; // ODBC: 0 means "no stated limit", use a safe cap
+    // ---- Determine max params per statement -----------------------------------
+    // SQL_MAX_PARAMS_IN_SELECT is a Windows-only ODBC constant not available in
+    // unixODBC headers.  Use a safe cross-platform cap instead; ODBC drivers
+    // that report 0 ("no stated limit") also end up here via this constant.
+    const SQLUSMALLINT maxParams = 32767;
 
     Py_ssize_t rowsPerChunk = (Py_ssize_t)(maxParams / cols);
     if (rowsPerChunk <= 0)
@@ -2509,6 +2493,23 @@ PyTypeObject NullParamType =
 };
 
 PyObject* null_binary;
+
+// ---------------------------------------------------------------------------
+// ExecuteBatch
+//
+// Public entry point for Cursor_executebatch.  Chooses the optimal strategy:
+//   - INSERT ... VALUES (?,...)  → ExecuteBatchInsert  (single multi-row SQL)
+//   - everything else            → ExecuteMultiFallback (prepare-once/execute-N)
+//
+// IsInsertValues is kept static (internal to this translation unit) and called
+// only from here, avoiding any cross-TU linkage issues.
+// ---------------------------------------------------------------------------
+bool ExecuteBatch(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
+{
+    if (IsInsertValues(pSql))
+        return ExecuteBatchInsert(cur, pSql, paramArrayObj);
+    return ExecuteMultiFallback(cur, pSql, paramArrayObj);
+}
 
 bool Params_init()
 {
