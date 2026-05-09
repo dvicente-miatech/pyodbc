@@ -2844,12 +2844,86 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     return resultDict;
 }
 
+static char executebatch_doc[] =
+    "executebatch(sql, params) -> None\n"
+    "\n"
+    "Execute a parameterized SQL statement against all parameter rows in one\n"
+    "efficient operation, without requiring fast_executemany.\n"
+    "\n"
+    "For INSERT ... VALUES (?,?) statements the rows are sent to the server in\n"
+    "a single multi-row VALUES clause (one SQLExecute per sub-batch), making it\n"
+    "as fast as fast_executemany but compatible with drivers that do not support\n"
+    "ODBC parameter arrays (e.g. IBM i Access ODBC Driver).\n"
+    "\n"
+    "For UPDATE, DELETE, MERGE or any other statement the method falls back to\n"
+    "prepare-once / bind-once / execute-N mode (ExecuteMultiFallback), which\n"
+    "avoids the per-row re-bind overhead of plain executemany and never touches\n"
+    "SQL_ATTR_PARAMSET_SIZE or SQL_ATTR_PARAM_BIND_OFFSET_PTR.\n"
+    "\n"
+    "Parameters\n"
+    "----------\n"
+    "sql    : str   Parameterized SQL statement with '?' placeholders.\n"
+    "params : iterable of sequences   One sequence of values per row.\n";
+
+static PyObject* Cursor_executebatch(PyObject* self, PyObject* args)
+{
+    Cursor* cursor = Cursor_Validate(self, CURSOR_REQUIRE_OPEN | CURSOR_RAISE_ERROR);
+    if (!cursor)
+        return 0;
+
+    cursor->rowcount = -1;
+
+    PyObject* pSql;
+    PyObject* param_seq;
+    if (!PyArg_ParseTuple(args, "OO", &pSql, &param_seq))
+        return 0;
+
+    if (!PyUnicode_Check(pSql))
+    {
+        PyErr_SetString(PyExc_TypeError,
+            "The first argument to executebatch must be a string or unicode query.");
+        return 0;
+    }
+
+    if (!IsSequence(param_seq))
+    {
+        PyErr_SetString(PyExc_TypeError,
+            "The second argument to executebatch must be a sequence of parameter rows.");
+        return 0;
+    }
+
+    Py_ssize_t rowcount = PySequence_Size(param_seq);
+    if (rowcount == 0)
+        Py_RETURN_NONE;
+
+    free_results(cursor, FREE_STATEMENT | KEEP_PREPARED);
+
+    bool ok;
+    if (IsInsertValues(pSql))
+    {
+        // INSERT ... VALUES (?,?) → expand to multi-row VALUES, 1 SQLExecute per sub-batch
+        ok = ExecuteBatchInsert(cursor, pSql, param_seq);
+    }
+    else
+    {
+        // UPDATE / DELETE / MERGE / anything else →
+        // prepare-once / bind-once / execute-N  (IBM i compatible, no array binding)
+        ok = ExecuteMultiFallback(cursor, pSql, param_seq);
+    }
+
+    if (!ok)
+        return 0;
+
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef Cursor_methods[] =
 
 {
     { "close",            (PyCFunction)Cursor_close,            METH_NOARGS,                close_doc            },
     { "execute",          (PyCFunction)Cursor_execute,          METH_VARARGS,               execute_doc          },
     { "executemany",      (PyCFunction)Cursor_executemany,      METH_VARARGS,               executemany_doc      },
+    { "executebatch",     (PyCFunction)Cursor_executebatch,     METH_VARARGS,               executebatch_doc     },
     { "setinputsizes",    (PyCFunction)Cursor_setinputsizes,    METH_O,                     setinputsizes_doc    },
     { "setoutputsize",    (PyCFunction)Cursor_ignored,          METH_VARARGS,               ignored_doc          },
     { "fetchval",         (PyCFunction)Cursor_fetchval,         METH_NOARGS,                fetchval_doc         },

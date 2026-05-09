@@ -2065,6 +2065,352 @@ bool ExecuteMultiFallback(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
 }
 
 
+// ---------------------------------------------------------------------------
+// IsInsertValues
+//
+// Returns true if pSql is a simple INSERT ... VALUES (?, ...) statement with
+// no subquery.  Detection is intentionally conservative: we look for the
+// tokens INSERT and VALUES (case-insensitive) in order, verify there is no
+// SELECT inside the VALUES clause (which would indicate a subquery), and
+// require the VALUES placeholder group to end at the end of the string.
+//
+// We work on the raw wchar_t buffer to avoid creating a temporary Python str.
+// ---------------------------------------------------------------------------
+static bool IsInsertValues(PyObject* pSql)
+{
+    if (!PyUnicode_Check(pSql))
+        return false;
+
+    Py_ssize_t   len = 0;
+    const wchar_t* p = PyUnicode_AsWideCharString(pSql, &len);
+    if (!p)
+    {
+        PyErr_Clear();
+        return false;
+    }
+
+    // Helper: case-insensitive wide-char prefix match advancing *pos.
+    // Returns true and advances *pos past the keyword + any trailing whitespace.
+    auto skipKw = [&](Py_ssize_t* pos, const wchar_t* kw) -> bool {
+        Py_ssize_t i = *pos, ki = 0;
+        while (kw[ki])
+        {
+            if (i >= len) return false;
+            wchar_t c = p[i];
+            if (c >= L'a' && c <= L'z') c -= 32;
+            wchar_t k = kw[ki];
+            if (k >= L'a' && k <= L'z') k -= 32;
+            if (c != k) return false;
+            ++i; ++ki;
+        }
+        // keyword must be followed by whitespace or end-of-string
+        if (i < len && p[i] != L' ' && p[i] != L'\t' && p[i] != L'\n' && p[i] != L'\r')
+            return false;
+        while (i < len && (p[i] == L' ' || p[i] == L'\t' || p[i] == L'\n' || p[i] == L'\r'))
+            ++i;
+        *pos = i;
+        return true;
+    };
+
+    // Skip leading whitespace
+    Py_ssize_t pos = 0;
+    while (pos < len && (p[pos] == L' ' || p[pos] == L'\t' || p[pos] == L'\n' || p[pos] == L'\r'))
+        ++pos;
+
+    // Must start with INSERT
+    if (!skipKw(&pos, L"INSERT"))
+    {
+        PyMem_Free((void*)p);
+        return false;
+    }
+
+    // Scan forward looking for VALUES token (skip everything between INSERT and VALUES)
+    bool foundValues = false;
+    while (pos < len)
+    {
+        // Skip whitespace
+        while (pos < len && (p[pos] == L' ' || p[pos] == L'\t' || p[pos] == L'\n' || p[pos] == L'\r'))
+            ++pos;
+        Py_ssize_t tmp = pos;
+        if (skipKw(&tmp, L"VALUES"))
+        {
+            pos = tmp;
+            foundValues = true;
+            break;
+        }
+        // advance one character and keep scanning
+        ++pos;
+    }
+
+    if (!foundValues)
+    {
+        PyMem_Free((void*)p);
+        return false;
+    }
+
+    // After VALUES there must be a '(' ... ')' group containing only '?', ',', ' ', and no SELECT
+    // A SELECT inside VALUES would indicate a subquery -- reject that.
+    bool hasSelect = false;
+    {
+        Py_ssize_t tmp = pos;
+        while (tmp < len - 5)
+        {
+            wchar_t c = p[tmp];
+            if (c == L'S' || c == L's')
+            {
+                Py_ssize_t t2 = tmp;
+                if (skipKw(&t2, L"SELECT"))
+                {
+                    hasSelect = true;
+                    break;
+                }
+            }
+            ++tmp;
+        }
+    }
+
+    PyMem_Free((void*)p);
+    return !hasSelect;
+}
+
+
+// ---------------------------------------------------------------------------
+// ExecuteBatchInsert
+//
+// Performs a single-round-trip batch INSERT using a multi-row VALUES clause:
+//
+//   INSERT INTO t (a, b) VALUES (?,?),(?,?),(?,?)
+//
+// Algorithm:
+//   1. Parse pSql to extract prefix ("INSERT INTO t (a,b) VALUES ") and the
+//      single-row placeholder group ("(?,?)").
+//   2. Query SQL_MAX_PARAMS_IN_SELECT from the driver; fall back to 32767.
+//   3. Compute how many rows fit per sub-batch = max_params / cols_per_row.
+//   4. For each sub-batch:
+//        a. Build the expanded SQL string.
+//        b. PrepareOnCursor (pyodbc caches by pointer; we use a fresh PyObject
+//           each time so the driver re-prepares for different sub-batch sizes,
+//           which only happens for the last chunk when len(data) % chunk != 0).
+//        c. Flatten the sub-batch params into a Python list and call
+//           PrepareAndBind + SQLExecute.
+//
+// For UPDATE/DELETE/MERGE the caller uses ExecuteMultiFallback directly.
+// ---------------------------------------------------------------------------
+bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
+{
+    // ---- Convert paramArrayObj to a fast sequence -------------------------
+    PyObject* rowseq = PySequence_Fast(paramArrayObj, "Parameter array must be a sequence.");
+    if (!rowseq)
+        return false;
+
+    Py_ssize_t rowcount = PySequence_Fast_GET_SIZE(rowseq);
+    if (rowcount == 0)
+    {
+        Py_DECREF(rowseq);
+        return true;
+    }
+
+    PyObject** rowptr = PySequence_Fast_ITEMS(rowseq);
+
+    // Determine column count from first row
+    PyObject* firstrow = rowptr[0];
+    PyObject* firstseq = PySequence_Fast(firstrow, "Each row must be a sequence.");
+    if (!firstseq)
+    {
+        Py_DECREF(rowseq);
+        return false;
+    }
+    Py_ssize_t cols = PySequence_Fast_GET_SIZE(firstseq);
+    Py_DECREF(firstseq);
+
+    if (cols == 0)
+    {
+        Py_DECREF(rowseq);
+        PyErr_SetString(PyExc_ValueError, "executebatch: rows must have at least one column.");
+        return false;
+    }
+
+    // ---- Parse pSql into prefix + placeholder ----------------------------
+    // We need the original SQL to extract:
+    //   prefix      = everything up to and including "VALUES "
+    //   placeholder = "(?,?)" (the single-row group)
+    //
+    // Strategy: find the last occurrence of '(' before end-of-string —
+    // that is the start of the placeholder group.  Everything before it
+    // (inclusive of any trailing spaces after VALUES) is the prefix.
+
+    Py_ssize_t sqlLen = 0;
+    const wchar_t* sqlW = PyUnicode_AsWideCharString(pSql, &sqlLen);
+    if (!sqlW)
+    {
+        Py_DECREF(rowseq);
+        return false;
+    }
+
+    // Find last '(' in the SQL — that is the start of the VALUES group
+    Py_ssize_t parenStart = sqlLen - 1;
+    while (parenStart >= 0 && sqlW[parenStart] != L'(')
+        --parenStart;
+
+    if (parenStart < 0)
+    {
+        PyMem_Free((void*)sqlW);
+        Py_DECREF(rowseq);
+        PyErr_SetString(PyExc_ValueError,
+            "executebatch: cannot locate VALUES placeholder group '(' in INSERT statement.");
+        return false;
+    }
+
+    // prefix  = sqlW[0 .. parenStart-1]  (trim trailing spaces for clean join)
+    Py_ssize_t prefixLen = parenStart;
+    // placeholder = sqlW[parenStart .. sqlLen-1]  e.g. L"(?,?)"
+    // (includes the closing paren already present in the original SQL)
+
+    // Build Python str objects for prefix and placeholder
+    PyObject* pyPrefix      = PyUnicode_FromWideChar(sqlW, prefixLen);
+    PyObject* pyPlaceholder = PyUnicode_FromWideChar(sqlW + parenStart, sqlLen - parenStart);
+    PyMem_Free((void*)sqlW);
+
+    if (!pyPrefix || !pyPlaceholder)
+    {
+        Py_XDECREF(pyPrefix);
+        Py_XDECREF(pyPlaceholder);
+        Py_DECREF(rowseq);
+        return false;
+    }
+
+    // ---- Determine max params per statement from the driver ---------------
+    SQLUSMALLINT maxParams = 0;
+    SQLGetInfo(cur->cnxn->hdbc, SQL_MAX_PARAMS_IN_SELECT,
+               &maxParams, sizeof(maxParams), NULL);
+    if (maxParams == 0)
+        maxParams = 32767; // ODBC: 0 means "no stated limit", use a safe cap
+
+    Py_ssize_t rowsPerChunk = (Py_ssize_t)(maxParams / cols);
+    if (rowsPerChunk <= 0)
+        rowsPerChunk = 1;
+
+    // ---- Process sub-batches ---------------------------------------------
+    bool ok = true;
+    PyObject* comma = PyUnicode_FromString(",");
+
+    for (Py_ssize_t start = 0; start < rowcount && ok; start += rowsPerChunk)
+    {
+        Py_ssize_t end   = start + rowsPerChunk;
+        if (end > rowcount) end = rowcount;
+        Py_ssize_t chunk = end - start;
+
+        // Build expanded SQL: prefix + "(?,?)," * chunk  (last without trailing comma)
+        // Use PyUnicode_Join for simplicity and correctness with all unicode content.
+        PyObject* parts = PyList_New(chunk);
+        if (!parts) { ok = false; break; }
+        for (Py_ssize_t i = 0; i < chunk; i++)
+        {
+            Py_INCREF(pyPlaceholder);
+            PyList_SET_ITEM(parts, i, pyPlaceholder);
+        }
+        PyObject* expandedBody = PyUnicode_Join(comma, parts);
+        Py_DECREF(parts);
+        if (!expandedBody) { ok = false; break; }
+
+        PyObject* expandedSql = PyUnicode_Concat(pyPrefix, expandedBody);
+        Py_DECREF(expandedBody);
+        if (!expandedSql) { ok = false; break; }
+
+        // Build flat params list: [row0col0, row0col1, row1col0, row1col1, ...]
+        PyObject* flatParams = PyList_New(chunk * cols);
+        if (!flatParams)
+        {
+            Py_DECREF(expandedSql);
+            ok = false;
+            break;
+        }
+
+        bool buildOk = true;
+        for (Py_ssize_t r = 0; r < chunk && buildOk; r++)
+        {
+            PyObject* row    = rowptr[start + r];
+            PyObject* rowseq2 = PySequence_Fast(row, "Row must be a sequence.");
+            if (!rowseq2) { buildOk = false; break; }
+
+            if (PySequence_Fast_GET_SIZE(rowseq2) != cols)
+            {
+                PyErr_Format(PyExc_ValueError,
+                    "executebatch: row %zd has %zd columns, expected %zd.",
+                    start + r, PySequence_Fast_GET_SIZE(rowseq2), cols);
+                Py_DECREF(rowseq2);
+                buildOk = false;
+                break;
+            }
+
+            PyObject** cells = PySequence_Fast_ITEMS(rowseq2);
+            for (Py_ssize_t c = 0; c < cols; c++)
+            {
+                Py_INCREF(cells[c]);
+                PyList_SET_ITEM(flatParams, r * cols + c, cells[c]);
+            }
+            Py_DECREF(rowseq2);
+        }
+
+        if (!buildOk)
+        {
+            Py_DECREF(flatParams);
+            Py_DECREF(expandedSql);
+            ok = false;
+            break;
+        }
+
+        // PrepareAndBind + SQLExecute for this sub-batch.
+        // skip_first=false: flatParams contains only values, no leading SQL string.
+        if (!PrepareAndBind(cur, expandedSql, flatParams, false))
+        {
+            Py_DECREF(flatParams);
+            Py_DECREF(expandedSql);
+            ok = false;
+            break;
+        }
+
+        SQLRETURN rc;
+        Py_BEGIN_ALLOW_THREADS
+        rc = SQLExecute(cur->hstmt);
+        Py_END_ALLOW_THREADS
+
+        Py_DECREF(flatParams);
+        Py_DECREF(expandedSql);
+
+        if (cur->cnxn->hdbc == SQL_NULL_HANDLE)
+        {
+            RaiseErrorV(0, ProgrammingError, "The cursor's connection was closed.");
+            ok = false;
+            break;
+        }
+
+        if (!SQL_SUCCEEDED(rc) && rc != SQL_NO_DATA)
+        {
+            RaiseErrorFromHandle(cur->cnxn, "SQLExecute", cur->cnxn->hdbc, cur->hstmt);
+            ok = false;
+            break;
+        }
+
+        if (rc == SQL_SUCCESS_WITH_INFO)
+            GetDiagRecs(cur);
+
+        // Close cursor state for next sub-batch (keeps the HSTMT alive)
+        SQLFreeStmt(cur->hstmt, SQL_CLOSE);
+    }
+
+    Py_DECREF(comma);
+    Py_DECREF(pyPrefix);
+    Py_DECREF(pyPlaceholder);
+    Py_DECREF(rowseq);
+
+    if (ok)
+        FreeParameterData(cur);
+
+    return ok;
+}
+
+
 static bool GetParamType(Cursor* cur, Py_ssize_t index, SQLSMALLINT& type)
 {
     // Returns the ODBC type of the of given parameter.
