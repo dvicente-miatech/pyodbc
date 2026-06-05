@@ -2826,6 +2826,19 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         }
     }
     
+    // Close the server-side cursor before unbinding parameters.  On IBM i
+    // (and other drivers), SQLEndTran (called by __exit__ when autocommit is
+    // off) frees server-side cursor state while the hstmt still holds a
+    // reference to it.  The subsequent SQLFreeHandle then crashes.  Calling
+    // SQL_CLOSE here releases that state in a controlled way, before any
+    // commit can happen.
+    if (cur->cnxn->hdbc != SQL_NULL_HANDLE)
+    {
+        Py_BEGIN_ALLOW_THREADS
+        SQLFreeStmt(cur->hstmt, SQL_CLOSE);
+        Py_END_ALLOW_THREADS
+    }
+
     FreeParameterData(cur);
 
     // Step 9: Return results
