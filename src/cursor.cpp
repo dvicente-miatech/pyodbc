@@ -2422,22 +2422,35 @@ static char CallProcedure_doc[] =
     "call_proc(schema, procedure, parameters) -> {results: [], parameters: {}}\n"
     "Executes a stored procedure with dictionary parameters and returns input/output parameters and result sets.\n";
 
+static PyObject* StringFromODBCBuffer(const char* buf)
+{
+    // IBM i ODBC returns character data in the connection's ANSI code page
+    // (typically Latin-1 / CP1252), not necessarily UTF-8.  Try UTF-8 first
+    // for drivers that do the right thing, then fall back to Latin-1 so that
+    // accented characters don't produce NULL and crash the caller.
+    PyObject* obj = PyUnicode_FromString(buf);
+    if (!obj) {
+        PyErr_Clear();
+        obj = PyUnicode_DecodeLatin1(buf, strlen(buf), "replace");
+    }
+    if (!obj) {
+        PyErr_Clear();
+        Py_INCREF(Py_None);
+        obj = Py_None;
+    }
+    return obj;
+}
+
 static PyObject* GetParamValue(Cursor* cur, ParamInfo& info)
 {
     if (info.StrLen_or_Ind == SQL_NULL_DATA) {
         Py_RETURN_NONE;
     }
-    
-    // For character data
-    if (info.ValueType == SQL_C_CHAR && info.ParameterValuePtr) {
-        return PyUnicode_FromString((const char*)info.ParameterValuePtr);
-    }
-    
-    // For other types, return as string for safety
+
     if (info.ParameterValuePtr) {
-        return PyUnicode_FromString((const char*)info.ParameterValuePtr);
+        return StringFromODBCBuffer((const char*)info.ParameterValuePtr);
     }
-    
+
     Py_RETURN_NONE;
 }
 
@@ -2479,7 +2492,7 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
     char paramName[256];
     SQLSMALLINT paramType;
     SQLSMALLINT dataType;
-    SQLULEN columnSize;
+    SQLULEN columnSize = 0;
     SQLLEN cbParamName, cbParamType, cbDataType, cbColumnSize;
     
     SQLBindCol(cur->hstmt, 4, SQL_C_CHAR, paramName, sizeof(paramName), &cbParamName);      // COLUMN_NAME
@@ -2703,8 +2716,13 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
             SQLRETURN retDesc = SQLDescribeCol(cur->hstmt, col + 1, colName, (SQLSMALLINT)sizeof(colName),
                                                &nameLen, &colDescDataType, &colDescSize, &colDescDecimals, &colDescNullable);
             if (SQL_SUCCEEDED(retDesc)) {
-                colNames.push_back(PyUnicode_FromString((const char*)colName));
-                describeSuccessCount++;
+                PyObject* nameObj = PyUnicode_FromString((const char*)colName);
+                if (!nameObj) {
+                    PyErr_Clear();
+                    nameObj = PyUnicode_DecodeLatin1((const char*)colName, strlen((const char*)colName), "replace");
+                }
+                colNames.push_back(nameObj);
+                if (nameObj) describeSuccessCount++;
             } else {
                 char defaultName[32];
                 snprintf(defaultName, sizeof(defaultName), "Col%d", col + 1);
@@ -2728,70 +2746,85 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         // Create a list for this result set
         PyObject* rowsList = PyList_New(0);
         if (!rowsList) {
-            for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+            for (size_t i = 0; i < colNames.size(); i++) Py_XDECREF(colNames[i]);
             Py_DECREF(resultsList);
             FreeParameterData(cur);
             return PyErr_NoMemory();
         }
-        
+
         // Fetch rows manually
         int rowCount = 0;
         while (true) {
             Py_BEGIN_ALLOW_THREADS
             ret = SQLFetch(cur->hstmt);
             Py_END_ALLOW_THREADS
-            
+
             if (ret == SQL_NO_DATA) {
                 break;
             }
-            
+
             if (!SQL_SUCCEEDED(ret)) {
                 break;
             }
-            
+
             rowCount++;
-            
+
             // Create a dict for this row
             PyObject* rowDict = PyDict_New();
             if (!rowDict) {
-                for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+                for (size_t i = 0; i < colNames.size(); i++) Py_XDECREF(colNames[i]);
                 Py_DECREF(rowsList);
                 Py_DECREF(resultsList);
                 FreeParameterData(cur);
                 return PyErr_NoMemory();
             }
-            
+
             // Get each column value
             for (SQLSMALLINT col = 0; col < cCols; col++) {
                 char buffer[8192];
                 SQLLEN indicator = 0;
-                
+
                 Py_BEGIN_ALLOW_THREADS
                 ret = SQLGetData(cur->hstmt, col + 1, SQL_C_CHAR, buffer, sizeof(buffer), &indicator);
                 Py_END_ALLOW_THREADS
-                
+
                 PyObject* value = NULL;
-                
+
                 if (indicator == SQL_NULL_DATA) {
                     value = Py_None;
                     Py_INCREF(Py_None);
                 } else if (SQL_SUCCEEDED(ret)) {
+                    // IBM i ODBC returns data in the connection's ANSI code page (typically
+                    // Latin-1 / CP1252), not UTF-8.  Try UTF-8 first; fall back to Latin-1
+                    // so that accented characters (é, ñ, ó, etc.) don't produce NULL and
+                    // then crash on Py_DECREF(NULL).
                     value = PyUnicode_FromString(buffer);
+                    if (!value) {
+                        PyErr_Clear();
+                        value = PyUnicode_DecodeLatin1(buffer, strlen(buffer), "replace");
+                    }
+                    if (!value) {
+                        PyErr_Clear();
+                        value = Py_None;
+                        Py_INCREF(Py_None);
+                    }
                 } else {
                     // On error, use None
                     value = Py_None;
                     Py_INCREF(Py_None);
                 }
-                
-                PyDict_SetItem(rowDict, colNames[col], value);
-                Py_DECREF(value);
+
+                if (colNames[col] && value) {
+                    PyDict_SetItem(rowDict, colNames[col], value);
+                }
+                Py_XDECREF(value);
             }
-            
+
             PyList_Append(rowsList, rowDict);
             Py_DECREF(rowDict);
         }
-        
-        for (size_t i = 0; i < colNames.size(); i++) Py_DECREF(colNames[i]);
+
+        for (size_t i = 0; i < colNames.size(); i++) Py_XDECREF(colNames[i]);
 
         PyList_Append(resultsList, rowsList);
         Py_DECREF(rowsList);
@@ -2820,9 +2853,11 @@ static PyObject* Cursor_CallProcedure(PyObject* self, PyObject* args)
         if (procParams[i].ioType == SQL_PARAM_OUTPUT || procParams[i].ioType == SQL_PARAM_INPUT_OUTPUT) {
             PyObject* val = GetParamValue(cur, cur->paramInfos[i]);
             PyObject* key = PyUnicode_FromString(procParams[i].name);
-            PyDict_SetItem(paramsDict, key, val);
-            Py_DECREF(val);
-            Py_DECREF(key);
+            if (val && key) {
+                PyDict_SetItem(paramsDict, key, val);
+            }
+            Py_XDECREF(val);
+            Py_XDECREF(key);
         }
     }
     
