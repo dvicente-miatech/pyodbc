@@ -2289,6 +2289,29 @@ bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
     if (rowsPerChunk <= 0)
         rowsPerChunk = 1;
 
+    // DB2 for i5/OS (and other databases) impose a hard limit on the TEXT
+    // length of an SQL statement (~32 KB for IBM i, SQL0101).  The parameter
+    // count cap above is not enough: with many rows the generated string can
+    // easily exceed that limit even when the parameter count stays within
+    // bounds.  Calculate a tighter rowsPerChunk from actual string lengths.
+    //
+    //   totalLen ≈ prefixLen + chunk * (placeholderLen + 1) - 1
+    //   → chunk ≤ (maxSqlLen - prefixLen + 1) / (placeholderLen + 1)
+    {
+        const Py_ssize_t maxSqlLen   = 32000;   // safe margin below IBM i 32 KB limit
+        Py_ssize_t prefixChars       = PyUnicode_GetLength(pyPrefix);
+        Py_ssize_t placeholderChars  = PyUnicode_GetLength(pyPlaceholder);
+        Py_ssize_t available         = maxSqlLen - prefixChars + 1;
+        if (available > 0 && placeholderChars > 0)
+        {
+            Py_ssize_t maxRowsByLen = available / (placeholderChars + 1);
+            if (maxRowsByLen < 1)
+                maxRowsByLen = 1;
+            if (rowsPerChunk > maxRowsByLen)
+                rowsPerChunk = maxRowsByLen;
+        }
+    }
+
     // ---- Process sub-batches ---------------------------------------------
     bool ok = true;
     PyObject* comma = PyUnicode_FromString(",");
