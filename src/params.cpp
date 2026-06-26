@@ -2235,9 +2235,12 @@ bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
     //   prefix      = everything up to and including "VALUES "
     //   placeholder = "(?,?)" (the single-row group)
     //
-    // Strategy: find the last occurrence of '(' before end-of-string —
-    // that is the start of the placeholder group.  Everything before it
-    // (inclusive of any trailing spaces after VALUES) is the prefix.
+    // Strategy: find the VALUES keyword scanning forward (skipping string
+    // literals), then locate the opening '(' that follows it.  Use
+    // depth-tracking to find the matching ')' so that function calls inside
+    // the VALUES group (e.g. VARCHAR_FORMAT(CURRENT_DATE,'YYYYMMDD')) are
+    // handled correctly.  The naive "find last '('" approach fails when such
+    // calls appear because it picks up the wrong opening parenthesis.
 
     Py_ssize_t sqlLen = 0;
     const wchar_t* sqlW = PyUnicode_AsWideCharString(pSql, &sqlLen);
@@ -2247,10 +2250,59 @@ bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
         return false;
     }
 
-    // Find last '(' in the SQL — that is the start of the VALUES group
-    Py_ssize_t parenStart = sqlLen - 1;
-    while (parenStart >= 0 && sqlW[parenStart] != L'(')
-        --parenStart;
+    // Find the opening '(' of the VALUES group by scanning for the VALUES
+    // keyword and then advancing to the first '(' that follows it.
+    Py_ssize_t parenStart = -1;
+    {
+        bool inStr = false;
+        for (Py_ssize_t i = 0; i < sqlLen; i++)
+        {
+            wchar_t c = sqlW[i];
+            if (inStr)
+            {
+                if (c == L'\'')
+                {
+                    if (i + 1 < sqlLen && sqlW[i + 1] == L'\'')
+                        ++i;  // escaped ''
+                    else
+                        inStr = false;
+                }
+                continue;
+            }
+            if (c == L'\'') { inStr = true; continue; }
+
+            // Case-insensitive whole-word match for "VALUES"
+            if ((c == L'V' || c == L'v') && i + 6 <= sqlLen)
+            {
+                auto up = [](wchar_t ch) -> wchar_t {
+                    return (ch >= L'a' && ch <= L'z') ? ch - 32 : ch;
+                };
+                if (up(sqlW[i])   == L'V' && up(sqlW[i+1]) == L'A' &&
+                    up(sqlW[i+2]) == L'L' && up(sqlW[i+3]) == L'U' &&
+                    up(sqlW[i+4]) == L'E' && up(sqlW[i+5]) == L'S')
+                {
+                    bool wordEnd = (i + 6 >= sqlLen ||
+                        !(sqlW[i+6] == L'_' ||
+                          (sqlW[i+6] >= L'a' && sqlW[i+6] <= L'z') ||
+                          (sqlW[i+6] >= L'A' && sqlW[i+6] <= L'Z') ||
+                          (sqlW[i+6] >= L'0' && sqlW[i+6] <= L'9')));
+                    if (wordEnd)
+                    {
+                        Py_ssize_t j = i + 6;
+                        while (j < sqlLen &&
+                               (sqlW[j] == L' ' || sqlW[j] == L'\t' ||
+                                sqlW[j] == L'\n' || sqlW[j] == L'\r'))
+                            ++j;
+                        if (j < sqlLen && sqlW[j] == L'(')
+                        {
+                            parenStart = j;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (parenStart < 0)
     {
@@ -2261,14 +2313,52 @@ bool ExecuteBatchInsert(Cursor* cur, PyObject* pSql, PyObject* paramArrayObj)
         return false;
     }
 
-    // prefix  = sqlW[0 .. parenStart-1]  (trim trailing spaces for clean join)
-    Py_ssize_t prefixLen = parenStart;
-    // placeholder = sqlW[parenStart .. sqlLen-1]  e.g. L"(?,?)"
-    // (includes the closing paren already present in the original SQL)
+    // Use depth-tracking to find the matching ')' for the VALUES group,
+    // correctly skipping over string literals and nested function-call parens.
+    Py_ssize_t parenEnd = -1;
+    {
+        int depth = 0;
+        bool inStr = false;
+        for (Py_ssize_t i = parenStart; i < sqlLen; i++)
+        {
+            wchar_t c = sqlW[i];
+            if (inStr)
+            {
+                if (c == L'\'')
+                {
+                    if (i + 1 < sqlLen && sqlW[i + 1] == L'\'')
+                        ++i;
+                    else
+                        inStr = false;
+                }
+                continue;
+            }
+            if (c == L'\'') { inStr = true; continue; }
+            if (c == L'(')  { ++depth; continue; }
+            if (c == L')')
+            {
+                if (--depth == 0)
+                {
+                    parenEnd = i;
+                    break;
+                }
+            }
+        }
+    }
 
-    // Build Python str objects for prefix and placeholder
-    PyObject* pyPrefix      = PyUnicode_FromWideChar(sqlW, prefixLen);
-    PyObject* pyPlaceholder = PyUnicode_FromWideChar(sqlW + parenStart, sqlLen - parenStart);
+    if (parenEnd < 0)
+    {
+        PyMem_Free((void*)sqlW);
+        Py_DECREF(rowseq);
+        PyErr_SetString(PyExc_ValueError,
+            "executebatch: unmatched '(' in VALUES group of INSERT statement.");
+        return false;
+    }
+
+    // prefix      = sqlW[0 .. parenStart-1]  (everything before the '(')
+    // placeholder = sqlW[parenStart .. parenEnd]  e.g. "(?,?)" or "(?,USER,'X')"
+    PyObject* pyPrefix      = PyUnicode_FromWideChar(sqlW, parenStart);
+    PyObject* pyPlaceholder = PyUnicode_FromWideChar(sqlW + parenStart, parenEnd - parenStart + 1);
     PyMem_Free((void*)sqlW);
 
     if (!pyPrefix || !pyPlaceholder)
